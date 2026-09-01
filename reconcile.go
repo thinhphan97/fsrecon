@@ -32,6 +32,9 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 	if closed {
 		return ReconcileReport{}, ErrClosed
 	}
+	if t.pending != nil {
+		return t.resumePending(ctx)
+	}
 	t.setState(StateReconciling)
 	report := ReconcileReport{StartedAt: time.Now()}
 	report.Generation = t.generation.Load() + 1
@@ -47,7 +50,10 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 		t.setConsistentState()
 		return report, nil
 	}
-	if store, ok := t.store.(*BoltStore); ok && len(scopes) == 1 && scopes[0] == t.root {
+	// The Bolt fast path owns a temporary index whose lifetime ends at return;
+	// use the journal-capable generic path when authoritative delivery may need
+	// an in-process retry.
+	if store, ok := t.store.(*BoltStore); ok && t.config.ChangeSink == nil && len(scopes) == 1 && scopes[0] == t.root {
 		return t.reconcileBoltLocked(ctx, store, report)
 	}
 
@@ -138,7 +144,7 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 		return fail(err)
 	}
 	report.Events = make([]Event, 0, min(t.config.ReportEventLimit, len(actual)+len(previous)))
-	delivery := newChangeBatcher(ctx, t.config.ChangeSink, t.sessionID, report.Generation, t.config.ChangeBatchSize)
+	allEvents := make([]Event, 0)
 	err = internalreconcile.WalkDiffScoped(toInternalStates(previous), toInternalStates(actual), expected, func(state internalreconcile.State) bool {
 		return t.config.ExpectedScope == ExpectedAllEntries || fileTypeFromInternal(state.Type) == FileTypeRegular
 	}, func(change internalreconcile.Change) error {
@@ -148,7 +154,8 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 		}
 		countEvent(&report, event.Kind)
 		t.addReportEvent(&report, event)
-		return delivery.Add(event)
+		allEvents = append(allEvents, event)
+		return nil
 	})
 	if err != nil {
 		return fail(err)
@@ -156,12 +163,7 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 	for _, event := range policyEvents {
 		countEvent(&report, event.Kind)
 		t.addReportEvent(&report, event)
-		if err := delivery.Add(event); err != nil {
-			return fail(err)
-		}
-	}
-	if err := delivery.Finish(); err != nil {
-		return fail(err)
+		allEvents = append(allEvents, event)
 	}
 
 	deletes := make([]string, 0)
@@ -173,6 +175,13 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 	puts := make([]FileState, 0, len(actual))
 	for _, state := range actual {
 		puts = append(puts, state)
+	}
+	if t.config.ChangeSink != nil {
+		t.pending = &pendingGeneration{sessionID: t.sessionID, generation: report.Generation, report: report,
+			events: cloneEvents(allEvents), puts: append([]FileState(nil), puts...), deletes: append([]string(nil), deletes...)}
+		if err := t.deliverPending(ctx); err != nil {
+			return fail(err)
+		}
 	}
 	if batch, ok := t.store.(BatchSnapshotStore); ok {
 		if err := batch.Apply(ctx, puts, deletes); err != nil {
@@ -190,6 +199,7 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 			}
 		}
 	}
+	t.pending = nil
 
 	if expected != nil {
 		for path, entry := range expected {
@@ -212,6 +222,74 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 	for _, event := range report.Events {
 		t.sendEvent(event)
 	}
+	return report, nil
+}
+
+func cloneEvents(events []Event) []Event {
+	result := make([]Event, len(events))
+	for i, event := range events {
+		result[i] = event
+		if event.Before != nil {
+			value := *event.Before
+			result[i].Before = &value
+		}
+		if event.After != nil {
+			value := *event.After
+			result[i].After = &value
+		}
+	}
+	return result
+}
+
+func (t *Tracker) deliverPending(ctx context.Context) error {
+	if t.pending == nil || t.config.ChangeSink == nil {
+		return nil
+	}
+	delivery := newChangeBatcher(ctx, t.config.ChangeSink, t.pending.sessionID, t.pending.generation, t.config.ChangeBatchSize)
+	for _, event := range t.pending.events {
+		if err := delivery.Add(event); err != nil {
+			return err
+		}
+	}
+	return delivery.Finish()
+}
+
+func (t *Tracker) resumePending(ctx context.Context) (ReconcileReport, error) {
+	p := t.pending
+	report := p.report
+	started := time.Now()
+	if err := t.deliverPending(ctx); err != nil {
+		report.StartedAt, report.Duration = started, time.Since(started)
+		return report, err
+	}
+	if batch, ok := t.store.(BatchSnapshotStore); ok {
+		if err := batch.Apply(ctx, p.puts, p.deletes); err != nil {
+			report.StartedAt, report.Duration = started, time.Since(started)
+			return report, err
+		}
+	} else {
+		for _, path := range p.deletes {
+			if err := t.store.Delete(ctx, path); err != nil {
+				report.StartedAt, report.Duration = started, time.Since(started)
+				return report, err
+			}
+		}
+		for _, state := range p.puts {
+			if err := t.store.Put(ctx, state); err != nil {
+				report.StartedAt, report.Duration = started, time.Since(started)
+				return report, err
+			}
+		}
+	}
+	t.pending = nil
+	t.generation.Store(p.generation)
+	t.stats.reconciliations.Add(1)
+	t.stats.filesScanned.Add(report.Scanned)
+	t.stats.missingDetected.Add(report.Missing)
+	t.stats.orphansDetected.Add(report.Orphan)
+	t.stats.reportEventsTruncated.Add(report.EventsTruncated)
+	t.setConsistentState()
+	report.StartedAt, report.Duration = started, time.Since(started)
 	return report, nil
 }
 
@@ -347,7 +425,12 @@ func (t *Tracker) expectedRootCanBeExpected(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return ok && state.Type != FileTypeDirectory, nil
+	if !ok {
+		// A missing root cannot be stat'ed; a typeless expected root is a
+		// regular-file manifest entry and must still produce MISSING.
+		return true, nil
+	}
+	return state.Type != FileTypeDirectory, nil
 }
 
 func (t *Tracker) expectedPath(path string) (string, error) {

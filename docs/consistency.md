@@ -7,7 +7,7 @@ computes semantic changes, then applies the new snapshot.
 When `ChangeSink` is configured, the ordering is:
 
 ```text
-scan -> complete diff -> deliver all ChangeBatch values -> commit snapshot
+scan -> complete diff -> stage immutable generation -> deliver all ChangeBatch values -> commit snapshot
 ```
 
 A sink error prevents snapshot commit, leaves the tracker dirty, and allows the
@@ -16,6 +16,9 @@ after successful delivery can cause the same batch to be retried, so sinks must
 be idempotent and use `(SessionID, Generation, Sequence)` as the identity and
 `Final` as the generation boundary. Session IDs are regenerated on tracker
 restart; generation is monotonic only within one session.
+Once delivery starts, that identity always refers to the same payload. Failed
+delivery or snapshot commit retains the pending generation and retries it;
+filesystem changes observed meanwhile are deferred to a later generation.
 
 Watcher delivery is not a correctness boundary. Each native notification
 triggers reconciliation rather than being translated directly into a public

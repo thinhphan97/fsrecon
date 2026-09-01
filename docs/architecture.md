@@ -16,6 +16,8 @@ SnapshotStore -> scoped previous state -------------------------------+
 Filesystem -> batched streaming scanner -> actual state -------------+-> semantic diff
 ExpectedProvider/ScopedExpectedProvider ------------------------------+       |
                                                                              v
+                                                            pending generation
+                                                                    |
                                                             ChangeSink batches
                                                                              |
                                                                     snapshot commit
@@ -43,3 +45,5 @@ reconciliation streams the diff directly; Bolt reconciliation stages changes
 in its temporary database so a failed scan cannot expose a partial generation.
 Integrity scrub uses the same sink and session-local generation sequence, but
 does not mutate the metadata snapshot.
+Pending generations are retained for in-process retries after delivery or
+snapshot failures; they are discarded on process restart with the old session.

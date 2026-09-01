@@ -627,6 +627,25 @@ func TestExpectedStateFileRootInvalid(t *testing.T) {
 	}
 }
 
+func TestExpectedTypelessMissingFileRootOnFirstReconcile(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing.dat")
+	provider := expectedProviderFunc(func(_ context.Context, _ string, emit func(ExpectedEntry) error) error {
+		return emit(ExpectedEntry{Path: root})
+	})
+	tracker, err := New(Config{Root: root, Expected: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	report, err := tracker.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Missing != 1 || report.Invalid != 0 || report.Orphan != 0 {
+		t.Fatalf("report=%+v", report)
+	}
+}
+
 func ptrInt64(v int64) *int64 { return &v }
 
 func TestTrackerContextCancellationClosesChannels(t *testing.T) {

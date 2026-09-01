@@ -408,7 +408,9 @@ lifetime; a new tracker gets a new session, so generation is only monotonic
 within a session. All batches must succeed before fsrecon advances its
 snapshot. Sink failures leave the tracker dirty and the next reconciliation
 retries the same semantic diff with the same batch identity. Delivery is
-at-least-once, so sinks must be idempotent.
+at-least-once, so sinks must be idempotent. Once a batch is first attempted,
+its identity always refers to the same immutable payload; retries resend the
+staged generation rather than recomputing it from a changed filesystem.
 
 ```go
 stats := tracker.Stats()

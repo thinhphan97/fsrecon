@@ -66,8 +66,12 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 	if closed {
 		return IntegrityReport{}, ErrClosed
 	}
+	if t.pendingIntegrity != nil {
+		return t.resumePendingIntegrity(ctx)
+	}
 
 	report := IntegrityReport{StartedAt: time.Now(), Generation: t.generation.Load() + 1}
+	allEvents := make([]Event, 0)
 	var stage *os.File
 	var encoder *json.Encoder
 	var err error
@@ -133,6 +137,7 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 				return err
 			}
 		}
+		allEvents = append(allEvents, event)
 		return nil
 	})
 	report.Duration = time.Since(report.StartedAt)
@@ -160,6 +165,7 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 			}
 			if err := delivery.Add(eventFromStaged(staged)); err != nil {
 				_ = input.Close()
+				t.pendingIntegrity = &pendingIntegrityGeneration{sessionID: t.sessionID, generation: report.Generation, report: report, events: cloneEvents(allEvents)}
 				return report, err
 			}
 		}
@@ -167,6 +173,7 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 			return report, fmt.Errorf("fsrecon: close integrity change log: %w", err)
 		}
 		if err := delivery.Finish(); err != nil {
+			t.pendingIntegrity = &pendingIntegrityGeneration{sessionID: t.sessionID, generation: report.Generation, report: report, events: cloneEvents(allEvents)}
 			return report, err
 		}
 	}
@@ -178,6 +185,22 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 		t.sendEvent(event)
 	}
 	return report, nil
+}
+
+func (t *Tracker) resumePendingIntegrity(ctx context.Context) (IntegrityReport, error) {
+	p := t.pendingIntegrity
+	delivery := newChangeBatcher(ctx, t.config.ChangeSink, p.sessionID, p.generation, t.config.ChangeBatchSize)
+	for _, event := range p.events {
+		if err := delivery.Add(event); err != nil {
+			return p.report, err
+		}
+	}
+	if err := delivery.Finish(); err != nil {
+		return p.report, err
+	}
+	t.pendingIntegrity = nil
+	t.generation.Store(p.generation)
+	return p.report, nil
 }
 
 var _ IntegrityChecker = SHA256Checker{}
