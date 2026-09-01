@@ -4,6 +4,16 @@ The public package owns configuration, lifecycle, semantic events, reports,
 expected-state and snapshot-store contracts. Platform and algorithm details
 remain under `internal/`.
 
+Observer is an independent lightweight path-invalidation pipeline:
+
+```text
+native backend -> collector -> exact-path coalescing -> bounded Hint channel
+                         \-> topology resync -> broad subtree Hint
+```
+
+It shares only the low-level backend and watch-tree primitives with Tracker;
+it never creates snapshot metadata or expected-state entries.
+
 The implemented event path is:
 
 ```text

@@ -14,5 +14,9 @@ version. For storage pilots, measure separate layouts such as 100K, 1M, and
 file metadata, but recursive startup and topology resync still enumerate
 directories. Keep large fixture generation opt-in and outside normal CI.
 
+The benchmark suite is intentionally separate from Tracker reconciliation
+benchmarks: Tracker measures metadata scans and semantic diffs, while Observer
+measures invalidation throughput and directory-watch topology cost.
+
 Interpret event throughput, hint latency, pending-hint bounds, and watched
 directory count together; synthetic numbers are not production limits.

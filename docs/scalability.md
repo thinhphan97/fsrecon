@@ -28,4 +28,9 @@ implement optimized `ScopedSnapshotStore` traversal.
 Target measurements include files scanned per second, bytes of RAM per tracked
 entry, startup duration, idle CPU, event latency and recovery throughput.
 
+Observer has no per-file snapshot memory. Its steady-state memory is bounded by
+watched-directory registrations, `MaxPendingHints`, backend buffers, and the
+public hint channel. Recursive startup/resync still enumerates directories, so
+storage benchmarks must report both file count and directory count.
+
 See [benchmarks](benchmarks.md) for commands and the published baseline.

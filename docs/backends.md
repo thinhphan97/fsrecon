@@ -9,6 +9,10 @@ M5 uses `github.com/fsnotify/fsnotify` behind an internal backend interface:
 Raw backend events will never be exposed publicly. Tests assert eventual
 semantic state instead of platform-specific event sequences.
 
+Observer uses the same backend abstraction but exposes invalidation `Hint`
+values. Overflow and topology failures are converted to broad root hints;
+Observer does not attempt to reconstruct an ordered native event log.
+
 The tracker registers the configured root before its initial scan. Events that
 occur during that scan are drained concurrently by the collector and trigger
 another reconciliation, closing the scan-then-watch startup race without

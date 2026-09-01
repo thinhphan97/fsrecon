@@ -298,8 +298,9 @@ types are never exposed.
 | `ReportEventLimit` | `10000` | Maximum detailed events retained by one report; counters remain complete. |
 | `ChangeBatchSize` | `256` | Maximum events passed to one `ChangeSink` call. |
 
-The safe default is to ignore symlinks. Enable `FollowSymlinks` only when
-traversal outside the lexical root is acceptable for your application.
+The safe default is to ignore symlinks. Tracker can use `FollowSymlinks` only
+when traversal outside the lexical root is acceptable. Observer intentionally
+rejects `FollowSymlinks` until cycle-safe directory traversal is available.
 
 ## Snapshot stores
 
@@ -478,6 +479,7 @@ Scanned: 2  Healthy: 0  Missing: 0  Orphan: 0  Duration: 240.1µs
 | M11 — Integrity extension | Implemented (`Scrub`, SHA-256) |
 | M12 — Cross-platform hardening | Implemented with semantic integration tests |
 | M13 — Benchmarks and performance baseline | Implemented |
+| Observer — Lightweight invalidation hints | Implemented; see [Observer guide](docs/observer.md) |
 
 Current scalability characteristics:
 
