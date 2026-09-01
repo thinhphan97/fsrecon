@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -73,6 +74,31 @@ func (t *Tree) Count() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.watched)
+}
+
+// RemoveSubtree removes a path and all descendant registrations.
+func (t *Tree) RemoveSubtree(path string) error {
+	path = filepath.Clean(path)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var remove []string
+	for watched := range t.watched {
+		if watched != t.root && within(path, watched) {
+			remove = append(remove, watched)
+		}
+	}
+	sort.Slice(remove, func(i, j int) bool { return len(remove[i]) > len(remove[j]) })
+	for _, watched := range remove {
+		if err := t.backend.Remove(watched); err != nil && !isAlreadyGone(err) {
+			return err
+		}
+		delete(t.watched, watched)
+	}
+	return nil
+}
+
+func isAlreadyGone(err error) bool {
+	return err != nil && (strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "invalid argument"))
 }
 
 func inAnyScope(path string, scopes []string) bool {

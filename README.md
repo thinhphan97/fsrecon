@@ -121,6 +121,14 @@ With `Recursive` enabled, existing and newly created directories are registered
 with the native backend before their children are scanned. `ReconcileInterval`
 is optional and serves only as a full-scan safety net.
 
+## Observer
+
+Use `NewObserver` when your application already owns authoritative metadata and
+only needs bounded filesystem invalidation hints. Hints are not a complete or
+ordered operation log; startup, overflow, and backend loss produce broader
+subtree hints. Observer does not use snapshots, expected state, checksums, or
+ChangeSink generations.
+
 ## Run the demo
 
 The included demo creates a real temporary directory and performs create,
