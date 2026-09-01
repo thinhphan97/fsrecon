@@ -15,7 +15,8 @@ report counters.
 All public event channels and authoritative sink batches are bounded. If the
 best-effort consumer falls behind, `Stats.PublicEventsDropped` increases. A
 configured `ChangeSink` still receives the complete diff before snapshot
-advancement. Native watcher queue overflow increments `BackendOverflows`, marks
+advancement, in bounded batches keyed by session, generation and sequence.
+Native watcher queue overflow increments `BackendOverflows`, marks
 the root dirty, and schedules a full reconciliation while the collector keeps
 draining events.
 

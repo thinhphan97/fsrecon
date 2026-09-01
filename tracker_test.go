@@ -551,6 +551,84 @@ func TestExpectedDirectoryCanBeExplicit(t *testing.T) {
 	}
 }
 
+func TestExpectedStateSupportsFileRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "file.dat")
+	if err := os.WriteFile(root, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	typ := FileTypeRegular
+	provider := expectedProviderFunc(func(_ context.Context, _ string, emit func(ExpectedEntry) error) error {
+		return emit(ExpectedEntry{Path: root, Type: &typ, Size: ptrInt64(4)})
+	})
+	tracker, err := New(Config{Root: root, Expected: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	report, err := tracker.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Healthy != 1 || report.Missing != 0 || report.Invalid != 0 {
+		t.Fatalf("report=%+v", report)
+	}
+}
+
+func TestExpectedStateFileRootMissing(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "file.dat")
+	if err := os.WriteFile(root, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	typ := FileTypeRegular
+	provider := expectedProviderFunc(func(_ context.Context, _ string, emit func(ExpectedEntry) error) error {
+		return emit(ExpectedEntry{Path: root, Type: &typ})
+	})
+	tracker, err := New(Config{Root: root, Expected: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	if _, err := tracker.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	report, err := tracker.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Missing != 1 {
+		t.Fatalf("report=%+v", report)
+	}
+}
+
+func TestExpectedStateFileRootInvalid(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "file.dat")
+	if err := os.WriteFile(root, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := int64(99)
+	typ := FileTypeRegular
+	provider := expectedProviderFunc(func(_ context.Context, _ string, emit func(ExpectedEntry) error) error {
+		return emit(ExpectedEntry{Path: root, Type: &typ, Size: &want})
+	})
+	tracker, err := New(Config{Root: root, Expected: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	report, err := tracker.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Invalid != 1 {
+		t.Fatalf("report=%+v", report)
+	}
+}
+
+func ptrInt64(v int64) *int64 { return &v }
+
 func TestTrackerContextCancellationClosesChannels(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	tracker, err := New(Config{Root: t.TempDir(), Recursive: true})

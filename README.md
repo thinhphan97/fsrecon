@@ -402,11 +402,13 @@ truncation is separate: `ReconcileReport.EventsTruncated` and
 while aggregate counters remain complete.
 
 Applications requiring authoritative background delivery should configure a
-`ChangeSink`. Batches are identified by `(Generation, Sequence)` and `Final`
-marks the last batch. All batches must succeed before fsrecon advances its
+`ChangeSink`. Batches are identified by `(SessionID, Generation, Sequence)` and
+`Final` marks the last batch. `SessionID` is random and stable for one tracker
+lifetime; a new tracker gets a new session, so generation is only monotonic
+within a session. All batches must succeed before fsrecon advances its
 snapshot. Sink failures leave the tracker dirty and the next reconciliation
-retries the same semantic diff. Delivery is at-least-once, so sinks must handle
-repeated generation and sequence values.
+retries the same semantic diff with the same batch identity. Delivery is
+at-least-once, so sinks must be idempotent.
 
 ```go
 stats := tracker.Stats()

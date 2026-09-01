@@ -16,3 +16,7 @@ must not parse it into operating-system fields.
 Native kernels can produce different raw event sequences. Compatibility is
 defined in terms of eventual semantic state and events, not exact raw event
 counts or ordering.
+
+`ChangeBatch` delivery is at-least-once. Its idempotency key is
+`SessionID + Generation + Sequence`; `SessionID` changes when a tracker is
+recreated, while generation and sequence may restart from their initial values.

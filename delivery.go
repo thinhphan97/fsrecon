@@ -8,14 +8,15 @@ import (
 type changeBatcher struct {
 	ctx        context.Context
 	sink       ChangeSink
+	sessionID  string
 	generation uint64
 	sequence   uint64
 	limit      int
 	pending    []Event
 }
 
-func newChangeBatcher(ctx context.Context, sink ChangeSink, generation uint64, limit int) *changeBatcher {
-	return &changeBatcher{ctx: ctx, sink: sink, generation: generation, limit: limit}
+func newChangeBatcher(ctx context.Context, sink ChangeSink, sessionID string, generation uint64, limit int) *changeBatcher {
+	return &changeBatcher{ctx: ctx, sink: sink, sessionID: sessionID, generation: generation, limit: limit}
 }
 
 func (b *changeBatcher) Add(event Event) error {
@@ -41,6 +42,7 @@ func (b *changeBatcher) Finish() error {
 func (b *changeBatcher) flush(final bool) error {
 	events := append([]Event(nil), b.pending...)
 	batch := ChangeBatch{
+		SessionID:  b.sessionID,
 		Generation: b.generation,
 		Sequence:   b.sequence,
 		Final:      final,

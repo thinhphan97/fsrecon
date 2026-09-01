@@ -148,6 +148,10 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 
 	expectedEnabled := t.config.Expected != nil
 	if expectedEnabled {
+		rootExpectedAllowed, err := t.expectedRootCanBeExpected(ctx)
+		if err != nil {
+			return fail(fmt.Errorf("fsrecon: inspect expected root: %w", err))
+		}
 		if err := index.Update(func(tx *bolt.Tx) error {
 			bucket := tx.Bucket(workExpected)
 			return t.config.Expected.WalkExpected(ctx, t.root, func(entry ExpectedEntry) error {
@@ -155,7 +159,7 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 				if err != nil {
 					return err
 				}
-				if path == t.root {
+				if path == t.root && entry.Type == nil && !rootExpectedAllowed {
 					return nil
 				}
 				if t.config.Filter != nil {
@@ -314,7 +318,7 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 	if !expectedEnabled {
 		report.Healthy = report.Scanned - report.Created - report.Modified - report.Replaced
 	}
-	delivery := newChangeBatcher(ctx, t.config.ChangeSink, report.Generation, t.config.ChangeBatchSize)
+	delivery := newChangeBatcher(ctx, t.config.ChangeSink, t.sessionID, report.Generation, t.config.ChangeBatchSize)
 	if err := index.View(func(tx *bolt.Tx) error {
 		cursor := tx.Bucket(workChanges).Cursor()
 		for _, value := cursor.First(); value != nil; _, value = cursor.Next() {
@@ -401,12 +405,14 @@ func decodeStagedEvent(value []byte, event *Event) error {
 	if err := json.Unmarshal(value, &stored); err != nil {
 		return err
 	}
-	*event = Event{
-		Kind: stored.Kind, Path: stored.Path, OldPath: stored.OldPath,
-		Before: fileStateFromStored(stored.Before), After: fileStateFromStored(stored.After),
-		Source: stored.Source, Time: stored.Time,
-	}
+	*event = eventFromStaged(stored)
 	return nil
+}
+
+func eventFromStaged(stored stagedEvent) Event {
+	return Event{Kind: stored.Kind, Path: stored.Path, OldPath: stored.OldPath,
+		Before: fileStateFromStored(stored.Before), After: fileStateFromStored(stored.After),
+		Source: stored.Source, Time: stored.Time}
 }
 
 func storedState(state *FileState) *storedFileState {

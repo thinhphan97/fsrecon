@@ -37,6 +37,9 @@ hierarchy-collapsed DirtySet and schedule a subsequent pass. Only one
 reconciliation mutates a snapshot at a time.
 
 `Events()` is best-effort. When `ChangeSink` is configured, the complete diff
-is delivered in bounded generation batches before snapshot commit. Memory
+is delivered in bounded batches identified by `(SessionID, Generation,
+Sequence)` before snapshot commit. Memory
 reconciliation streams the diff directly; Bolt reconciliation stages changes
 in its temporary database so a failed scan cannot expose a partial generation.
+Integrity scrub uses the same sink and session-local generation sequence, but
+does not mutate the metadata snapshot.

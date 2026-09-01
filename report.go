@@ -26,12 +26,13 @@ type ReconcileReport struct {
 
 // IntegrityReport summarizes one explicit content scrub.
 type IntegrityReport struct {
-	StartedAt time.Time
-	Duration  time.Duration
-	Scanned   uint64
-	Healthy   uint64
-	Corrupt   uint64
-	Events    []Event
+	Generation uint64
+	StartedAt  time.Time
+	Duration   time.Duration
+	Scanned    uint64
+	Healthy    uint64
+	Corrupt    uint64
+	Events     []Event
 	// EventsTruncated counts corruption events omitted from Events after the
 	// configured ReportEventLimit. Aggregate counters still include them.
 	EventsTruncated uint64
@@ -46,7 +47,6 @@ type Stats struct {
 	EventsDropped         uint64
 	PublicEventsDropped   uint64
 	ReportEventsTruncated uint64
-	NativeEventsDropped   uint64
 	BackendOverflows      uint64
 	Reconciliations       uint64
 	FilesScanned          uint64

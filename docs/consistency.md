@@ -12,8 +12,10 @@ scan -> complete diff -> deliver all ChangeBatch values -> commit snapshot
 
 A sink error prevents snapshot commit, leaves the tracker dirty, and allows the
 same changes to be regenerated. Delivery is at-least-once: a store failure
-after successful delivery can cause the same generation and sequence to be
-retried, so sinks must be idempotent and use `Final` as the generation boundary.
+after successful delivery can cause the same batch to be retried, so sinks must
+be idempotent and use `(SessionID, Generation, Sequence)` as the identity and
+`Final` as the generation boundary. Session IDs are regenerated on tracker
+restart; generation is monotonic only within one session.
 
 Watcher delivery is not a correctness boundary. Each native notification
 triggers reconciliation rather than being translated directly into a public
@@ -42,7 +44,9 @@ The public event channel is bounded and is not a durable change log. If it
 fills, `Stats.PublicEventsDropped` and its compatibility alias `EventsDropped`
 increase. Report truncation is independently visible through
 `EventsTruncated` and `Stats.ReportEventsTruncated`; neither affects
-`ChangeSink` delivery.
+`ChangeSink` delivery. Integrity scrub corruption events use the same
+authoritative sink and bounded batching. Scrub does not modify the metadata
+snapshot; sink failure returns an error and leaves it unchanged.
 
 If the native event channel closes unexpectedly, the tracker enters
 `StateDegraded`. Reconciliation can establish current filesystem truth but does

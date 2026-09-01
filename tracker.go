@@ -68,6 +68,7 @@ type Tracker struct {
 	started        bool
 	closed         bool
 	backendHealthy bool
+	sessionID      string
 	cancel         context.CancelFunc
 
 	reconcileMu  sync.Mutex
@@ -96,7 +97,6 @@ type trackerStats struct {
 	corruptDetected       atomic.Uint64
 	publicEventsDropped   atomic.Uint64
 	reportEventsTruncated atomic.Uint64
-	nativeEventsDropped   atomic.Uint64
 	backendOverflows      atomic.Uint64
 }
 
@@ -129,6 +129,10 @@ func New(config Config) (*Tracker, error) {
 	if config.ExpectedScope > ExpectedAllEntries {
 		return nil, errors.New("fsrecon: invalid expected entry scope")
 	}
+	sessionID, err := newSessionID()
+	if err != nil {
+		return nil, fmt.Errorf("fsrecon: create session id: %w", err)
+	}
 	root, err := filepath.Abs(config.Root)
 	if err != nil {
 		return nil, fmt.Errorf("fsrecon: resolve root: %w", err)
@@ -150,7 +154,7 @@ func New(config Config) (*Tracker, error) {
 		config.DebounceWindow = defaultDebounceWindow
 	}
 	return &Tracker{
-		config: config, root: config.Root, store: config.Store,
+		config: config, root: config.Root, store: config.Store, sessionID: sessionID,
 		state: StateCreated, events: make(chan Event, config.EventBuffer),
 		errors:     make(chan error, 16),
 		newBackend: func(buffer uint) internalbackend.Backend { return fsnotifybackend.New(buffer) },
@@ -452,9 +456,9 @@ func (t *Tracker) Stats() Stats {
 		EventsReceived: t.stats.eventsReceived.Load(), EventsCoalesced: t.stats.eventsCoalesced.Load(),
 		EventsDropped: publicDropped, PublicEventsDropped: publicDropped,
 		ReportEventsTruncated: t.stats.reportEventsTruncated.Load(),
-		NativeEventsDropped:   t.stats.nativeEventsDropped.Load(), BackendOverflows: t.stats.backendOverflows.Load(),
-		Reconciliations: t.stats.reconciliations.Load(),
-		FilesScanned:    t.stats.filesScanned.Load(), MissingDetected: t.stats.missingDetected.Load(),
+		BackendOverflows:      t.stats.backendOverflows.Load(),
+		Reconciliations:       t.stats.reconciliations.Load(),
+		FilesScanned:          t.stats.filesScanned.Load(), MissingDetected: t.stats.missingDetected.Load(),
 		OrphansDetected: t.stats.orphansDetected.Load(), DirtyPaths: t.stats.dirtyPaths.Load(),
 		QueueDepth: uint64(len(t.events)), IntegrityScanned: t.stats.integrityScanned.Load(),
 		CorruptDetected: t.stats.corruptDetected.Load(),

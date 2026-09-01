@@ -129,3 +129,69 @@ func TestIntegrityReportIsBounded(t *testing.T) {
 		t.Fatalf("stats = %+v", tracker.Stats())
 	}
 }
+
+func TestScrubDeliversAllCorruptEventsToChangeSink(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 5; i++ {
+		if err := os.WriteFile(filepath.Join(root, string(rune('a'+i))), []byte("bad"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sink := &recordingChangeSink{}
+	tracker, err := New(Config{Root: root, Integrity: alwaysCorruptChecker{}, ChangeSink: sink, ReportEventLimit: 2, ChangeBatchSize: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	report, err := tracker.Scrub(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Corrupt != 5 || len(report.Events) != 2 || report.EventsTruncated != 3 {
+		t.Fatalf("report=%+v", report)
+	}
+	if sink.eventCount() != 5 {
+		t.Fatalf("sink events=%d", sink.eventCount())
+	}
+	for _, batch := range sink.snapshotBatches() {
+		if len(batch.Events) > 2 || batch.SessionID != tracker.sessionID || batch.Generation != report.Generation {
+			t.Fatalf("batch=%+v", batch)
+		}
+		for _, event := range batch.Events {
+			if event.Kind != EventCorrupt || event.Source != SourceIntegrity {
+				t.Fatalf("event=%+v", event)
+			}
+		}
+	}
+}
+
+func TestScrubChangeSinkFailureDoesNotAdvanceGeneration(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "file")
+	if err := os.WriteFile(path, []byte("bad"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sink := &recordingChangeSink{}
+	tracker, err := New(Config{Root: root, Integrity: alwaysCorruptChecker{}, ChangeSink: sink})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	if _, err := tracker.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before, ok, err := tracker.store.Get(context.Background(), path)
+	if err != nil || !ok {
+		t.Fatalf("snapshot=%v %v", before, err)
+	}
+	sink.mu.Lock()
+	sink.fail = errors.New("sink unavailable")
+	sink.mu.Unlock()
+	if _, err := tracker.Scrub(context.Background()); err == nil {
+		t.Fatal("expected sink failure")
+	}
+	after, ok, err := tracker.store.Get(context.Background(), path)
+	if err != nil || !ok || after != before {
+		t.Fatalf("snapshot changed: before=%+v after=%+v", before, after)
+	}
+}

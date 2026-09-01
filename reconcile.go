@@ -138,7 +138,7 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 		return fail(err)
 	}
 	report.Events = make([]Event, 0, min(t.config.ReportEventLimit, len(actual)+len(previous)))
-	delivery := newChangeBatcher(ctx, t.config.ChangeSink, report.Generation, t.config.ChangeBatchSize)
+	delivery := newChangeBatcher(ctx, t.config.ChangeSink, t.sessionID, report.Generation, t.config.ChangeBatchSize)
 	err = internalreconcile.WalkDiffScoped(toInternalStates(previous), toInternalStates(actual), expected, func(state internalreconcile.State) bool {
 		return t.config.ExpectedScope == ExpectedAllEntries || fileTypeFromInternal(state.Type) == FileTypeRegular
 	}, func(change internalreconcile.Change) error {
@@ -267,6 +267,11 @@ func (t *Tracker) loadExpectedScopes(ctx context.Context, scopes []string) (map[
 		return nil, nil
 	}
 	expected := make(map[string]internalreconcile.Expected)
+	var err error
+	rootExpectedAllowed, err := t.expectedRootCanBeExpected(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("fsrecon: inspect expected root: %w", err)
+	}
 	consume := func(entry ExpectedEntry) error {
 		path, err := t.expectedPath(entry.Path)
 		if err != nil {
@@ -284,7 +289,9 @@ func (t *Tracker) loadExpectedScopes(ctx context.Context, scopes []string) (map[
 			}
 		}
 		inScope := false
-		if path != t.root {
+		if path == t.root {
+			inScope = entry.Type != nil || rootExpectedAllowed
+		} else {
 			for _, scope := range scopes {
 				if pathHasPrefix(path, scope) {
 					inScope = true
@@ -310,7 +317,6 @@ func (t *Tracker) loadExpectedScopes(ctx context.Context, scopes []string) (map[
 		}
 		return nil
 	}
-	var err error
 	if scoped, ok := t.config.Expected.(ScopedExpectedProvider); ok {
 		for _, scope := range scopes {
 			if err = scoped.WalkExpectedScope(ctx, t.root, scope, consume); err != nil {
@@ -324,6 +330,24 @@ func (t *Tracker) loadExpectedScopes(ctx context.Context, scopes []string) (map[
 		return nil, fmt.Errorf("fsrecon: walk expected state: %w", err)
 	}
 	return expected, nil
+}
+
+// expectedRootCanBeExpected prevents the implicit directory root from being
+// treated as an application object while allowing a file root (including a
+// currently missing file represented by the previous snapshot).
+func (t *Tracker) expectedRootCanBeExpected(ctx context.Context) (bool, error) {
+	info, err := os.Lstat(t.root)
+	if err == nil {
+		return !info.IsDir(), nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return false, err
+	}
+	state, ok, err := t.store.Get(ctx, t.root)
+	if err != nil {
+		return false, err
+	}
+	return ok && state.Type != FileTypeDirectory, nil
 }
 
 func (t *Tracker) expectedPath(path string) (string, error) {

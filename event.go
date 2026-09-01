@@ -70,6 +70,7 @@ type Event struct {
 // A failed reconciliation may retry the same generation and sequences, so a
 // sink must apply them idempotently and only finalize a generation on Final.
 type ChangeBatch struct {
+	SessionID  string
 	Generation uint64
 	Sequence   uint64
 	Final      bool

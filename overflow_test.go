@@ -21,20 +21,28 @@ type fakeNativeBackend struct {
 }
 
 type recordingChangeSink struct {
-	mu      sync.Mutex
-	batches []ChangeBatch
-	fail    error
+	mu       sync.Mutex
+	batches  []ChangeBatch
+	attempts []ChangeBatch
+	fail     error
 }
 
 func (s *recordingChangeSink) ApplyChanges(_ context.Context, batch ChangeBatch) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	batch.Events = append([]Event(nil), batch.Events...)
+	s.attempts = append(s.attempts, batch)
 	if s.fail != nil {
 		return s.fail
 	}
-	batch.Events = append([]Event(nil), batch.Events...)
 	s.batches = append(s.batches, batch)
 	return nil
+}
+
+func (s *recordingChangeSink) snapshotAttempts() []ChangeBatch {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ChangeBatch(nil), s.attempts...)
 }
 
 func (s *recordingChangeSink) eventCount() int {
@@ -107,7 +115,7 @@ func TestBoundedPublicQueueDropsWithoutBlockingReconcile(t *testing.T) {
 	}
 	batches := sink.snapshotBatches()
 	for i, batch := range batches {
-		if len(batch.Events) > 3 || batch.Sequence != uint64(i) || batch.Generation != report.Generation {
+		if len(batch.Events) > 3 || batch.Sequence != uint64(i) || batch.Generation != report.Generation || batch.SessionID == "" || batch.SessionID != tracker.sessionID {
 			t.Fatalf("batch %d = %+v", i, batch)
 		}
 		if batch.Final != (i == len(batches)-1) {
@@ -198,6 +206,54 @@ func TestChangeSinkFailureDoesNotAdvanceSnapshot(t *testing.T) {
 	}
 	if report.Modified != 1 || report.Generation != 2 || tracker.State() != StateSynced {
 		t.Fatalf("recovery report=%+v state=%v", report, tracker.State())
+	}
+}
+
+func TestFailedDeliveryRetriesSameBatchIdentity(t *testing.T) {
+	root := t.TempDir()
+	sink := &recordingChangeSink{fail: errors.New("temporary sink failure")}
+	tracker, err := New(Config{Root: root, ChangeSink: sink, ChangeBatchSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	path := filepath.Join(root, "file")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tracker.Reconcile(context.Background()); err == nil {
+		t.Fatal("expected delivery failure")
+	}
+	sink.mu.Lock()
+	sink.fail = nil
+	sink.mu.Unlock()
+	if _, err := tracker.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	attempts := sink.snapshotAttempts()
+	if len(attempts) < 2 {
+		t.Fatalf("attempts=%d", len(attempts))
+	}
+	first, second := attempts[0], attempts[len(attempts)-1]
+	if first.SessionID == "" || first.SessionID != second.SessionID || first.Generation != second.Generation || first.Sequence != second.Sequence {
+		t.Fatalf("retry identity changed: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestChangeBatchSessionIDDiffersAcrossTrackers(t *testing.T) {
+	root := t.TempDir()
+	a, err := New(Config{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := New(Config{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	defer b.Close()
+	if a.sessionID == "" || a.sessionID == b.sessionID {
+		t.Fatalf("session IDs: %q %q", a.sessionID, b.sessionID)
 	}
 }
 

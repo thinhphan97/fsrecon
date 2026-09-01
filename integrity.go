@@ -1,9 +1,12 @@
 package fsrecon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -53,6 +56,8 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 	if t.config.Integrity == nil {
 		return IntegrityReport{}, ErrNoIntegrity
 	}
+	t.reconcileMu.Lock()
+	defer t.reconcileMu.Unlock()
 	t.integrityMu.Lock()
 	defer t.integrityMu.Unlock()
 	t.mu.RLock()
@@ -62,7 +67,21 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 		return IntegrityReport{}, ErrClosed
 	}
 
-	report := IntegrityReport{StartedAt: time.Now()}
+	report := IntegrityReport{StartedAt: time.Now(), Generation: t.generation.Load() + 1}
+	var stage *os.File
+	var encoder *json.Encoder
+	var err error
+	if t.config.ChangeSink != nil {
+		stage, err = os.CreateTemp("", "fsrecon-integrity-*.jsonl")
+		if err != nil {
+			return report, fmt.Errorf("fsrecon: create integrity change log: %w", err)
+		}
+		defer func() {
+			_ = stage.Close()
+			_ = os.Remove(stage.Name())
+		}()
+		encoder = json.NewEncoder(stage)
+	}
 	expected, err := t.loadExpectedScopes(ctx, []string{t.root})
 	if err != nil {
 		return report, err
@@ -105,15 +124,56 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 		} else {
 			report.EventsTruncated++
 		}
+		if encoder != nil {
+			if err := encoder.Encode(stagedEvent{
+				Kind: event.Kind, Path: event.Path, OldPath: event.OldPath,
+				Before: storedState(event.Before), After: storedState(event.After),
+				Source: event.Source, Time: event.Time,
+			}); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	report.Duration = time.Since(report.StartedAt)
 	if err != nil {
 		return report, fmt.Errorf("fsrecon: integrity scrub: %w", err)
 	}
+	if stage != nil {
+		if err := stage.Close(); err != nil {
+			return report, fmt.Errorf("fsrecon: close integrity change log: %w", err)
+		}
+		input, err := os.Open(stage.Name())
+		if err != nil {
+			return report, fmt.Errorf("fsrecon: open integrity change log: %w", err)
+		}
+		decoder := json.NewDecoder(bufio.NewReader(input))
+		delivery := newChangeBatcher(ctx, t.config.ChangeSink, t.sessionID, report.Generation, t.config.ChangeBatchSize)
+		for {
+			var staged stagedEvent
+			if err := decoder.Decode(&staged); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				_ = input.Close()
+				return report, fmt.Errorf("fsrecon: read integrity change log: %w", err)
+			}
+			if err := delivery.Add(eventFromStaged(staged)); err != nil {
+				_ = input.Close()
+				return report, err
+			}
+		}
+		if err := input.Close(); err != nil {
+			return report, fmt.Errorf("fsrecon: close integrity change log: %w", err)
+		}
+		if err := delivery.Finish(); err != nil {
+			return report, err
+		}
+	}
 	t.stats.integrityScanned.Add(report.Scanned)
 	t.stats.corruptDetected.Add(report.Corrupt)
 	t.stats.reportEventsTruncated.Add(report.EventsTruncated)
+	t.generation.Store(report.Generation)
 	for _, event := range report.Events {
 		t.sendEvent(event)
 	}
