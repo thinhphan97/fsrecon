@@ -58,3 +58,25 @@ func TestBackendCancellationClosesChannels(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRemoveAlreadyDeletedDirectoryIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "watched")
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := New(16)
+	if err := b.Start(context.Background(), root); err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if err := b.Add(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Remove(directory); err != nil {
+		t.Fatalf("Remove() after directory deletion = %v", err)
+	}
+}

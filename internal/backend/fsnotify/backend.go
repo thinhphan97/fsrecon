@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -98,7 +100,13 @@ func (b *Backend) Remove(path string) error {
 	if closed || watcher == nil {
 		return nil
 	}
-	if err := watcher.Remove(filepath.Clean(path)); err != nil && !errors.Is(err, fsnotifylib.ErrNonExistentWatch) {
+	if err := watcher.Remove(filepath.Clean(path)); err != nil {
+		// Windows resolves attributes while removing a watch and reports a
+		// PathError when the directory has already moved or disappeared. That
+		// is equivalent to fsnotify's non-existent-watch sentinel for cleanup.
+		if errors.Is(err, fsnotifylib.ErrNonExistentWatch) || errors.Is(err, fs.ErrNotExist) || os.IsNotExist(err) {
+			return nil
+		}
 		return fmt.Errorf("remove watch %q: %w", path, err)
 	}
 	return nil
