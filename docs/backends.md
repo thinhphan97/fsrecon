@@ -13,7 +13,8 @@ The tracker registers the configured root before its initial scan. Events that
 occur during that scan remain buffered and trigger another reconciliation,
 closing the scan-then-watch startup race.
 
-At M5 only the configured root is registered. Watching all existing and newly
-created descendant directories is M6. `Recursive` already controls scanning,
-but nested changes need `ReconcileInterval` as a safety net until the recursive
-watch tree is implemented.
+With `Recursive` enabled, the watch tree registers each directory before its
+children are scanned. New directories are watched before their contents are
+traversed, and watches below deleted subtrees are removed after reconciliation.
+The optional `ReconcileInterval` remains a safety net for kernel queue loss and
+changes made while the process was stopped.

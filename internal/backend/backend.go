@@ -27,6 +27,8 @@ type RawEvent struct {
 
 type Backend interface {
 	Start(ctx context.Context, root string) error
+	Add(path string) error
+	Remove(path string) error
 	Events() <-chan RawEvent
 	Errors() <-chan error
 	Close() error

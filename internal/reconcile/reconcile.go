@@ -13,8 +13,9 @@ type State struct {
 }
 
 type Expected struct {
-	Path string
-	Size *int64
+	Path        string
+	Size        *int64
+	Fingerprint []byte
 }
 
 type Kind uint8

@@ -3,6 +3,7 @@ package fsrecon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -118,6 +119,115 @@ func TestTrackerDetectsNativeFilesystemEvents(t *testing.T) {
 
 	if tracker.Stats().EventsReceived == 0 {
 		t.Fatal("native backend did not record raw events")
+	}
+}
+
+func TestTrackerWatchesExistingAndNewNestedDirectories(t *testing.T) {
+	root := t.TempDir()
+	existing := filepath.Join(root, "existing")
+	if err := os.Mkdir(existing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tracker, err := New(Config{Root: root, Recursive: true, EventBuffer: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	// Drain the initial directory event.
+	waitForEvent(t, tracker, EventCreated, existing, "")
+
+	existingFile := filepath.Join(existing, "file.txt")
+	if err := os.WriteFile(existingFile, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitForEvent(t, tracker, EventCreated, existingFile, "")
+
+	created := filepath.Join(root, "created")
+	if err := os.Mkdir(created, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	waitForEvent(t, tracker, EventCreated, created, "")
+	createdFile := filepath.Join(created, "nested.txt")
+	if err := os.WriteFile(createdFile, []byte("nested"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitForEvent(t, tracker, EventCreated, createdFile, "")
+}
+
+func TestPartialReconcileDetectsMoveAcrossDirtySubtrees(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a")
+	b := filepath.Join(root, "b")
+	if err := os.MkdirAll(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(a, "file")
+	newPath := filepath.Join(b, "file")
+	if err := os.WriteFile(oldPath, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tracker, err := New(Config{Root: root, Recursive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	if _, err := tracker.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		t.Fatal(err)
+	}
+	report, err := tracker.reconcileScopes(context.Background(), []string{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Moved != 1 || len(report.Events) != 1 || report.Events[0].OldPath != oldPath || report.Events[0].Path != newPath {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestPartialReconcileScansOnlyDirtySubtree(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a")
+	b := filepath.Join(root, "b")
+	if err := os.MkdirAll(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		if err := os.WriteFile(filepath.Join(b, fmt.Sprintf("file-%02d", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := filepath.Join(a, "target")
+	if err := os.WriteFile(target, []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tracker, err := New(Config{Root: root, Recursive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	if _, err := tracker.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("longer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := tracker.reconcileScopes(context.Background(), []string{a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Scanned != 1 || report.Modified != 1 {
+		t.Fatalf("report = %+v", report)
 	}
 }
 

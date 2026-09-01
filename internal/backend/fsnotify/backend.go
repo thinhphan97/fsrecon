@@ -76,6 +76,34 @@ func (b *Backend) Start(ctx context.Context, root string) error {
 func (b *Backend) Events() <-chan backend.RawEvent { return b.events }
 func (b *Backend) Errors() <-chan error            { return b.errors }
 
+func (b *Backend) Add(path string) error {
+	b.mu.Lock()
+	watcher := b.watcher
+	closed := b.closed
+	b.mu.Unlock()
+	if closed || watcher == nil {
+		return errors.New("fsnotify backend: not running")
+	}
+	if err := watcher.Add(filepath.Clean(path)); err != nil {
+		return fmt.Errorf("watch %q: %w", path, err)
+	}
+	return nil
+}
+
+func (b *Backend) Remove(path string) error {
+	b.mu.Lock()
+	watcher := b.watcher
+	closed := b.closed
+	b.mu.Unlock()
+	if closed || watcher == nil {
+		return nil
+	}
+	if err := watcher.Remove(filepath.Clean(path)); err != nil && !errors.Is(err, fsnotifylib.ErrNonExistentWatch) {
+		return fmt.Errorf("remove watch %q: %w", path, err)
+	}
+	return nil
+}
+
 func (b *Backend) Close() error {
 	b.mu.Lock()
 	b.closed = true

@@ -43,6 +43,7 @@ const (
 	FileTypeOther
 )
 
+// String returns the stable uppercase type name.
 func (t FileType) String() string {
 	names := [...]string{"UNKNOWN", "REGULAR", "DIRECTORY", "SYMLINK", "OTHER"}
 	if int(t) >= len(names) {

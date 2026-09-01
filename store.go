@@ -15,6 +15,13 @@ type SnapshotStore interface {
 	Walk(ctx context.Context, prefix string, fn func(FileState) error) error
 }
 
+// BatchSnapshotStore atomically applies one reconciliation when supported.
+// Tracker falls back to individual SnapshotStore operations otherwise.
+type BatchSnapshotStore interface {
+	SnapshotStore
+	Apply(ctx context.Context, puts []FileState, deletes []string) error
+}
+
 // MemoryStore is a concurrency-safe in-memory SnapshotStore.
 type MemoryStore struct {
 	mu      sync.RWMutex
@@ -80,6 +87,21 @@ func (s *MemoryStore) Walk(ctx context.Context, prefix string, fn func(FileState
 		if err := fn(state); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) Apply(ctx context.Context, puts []FileState, deletes []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, path := range deletes {
+		delete(s.entries, path)
+	}
+	for _, state := range puts {
+		s.entries[state.Path] = state
 	}
 	return nil
 }

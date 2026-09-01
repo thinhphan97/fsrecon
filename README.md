@@ -21,10 +21,9 @@ Expected state (optional) ─────┘
 ```
 
 > [!IMPORTANT]
-> The project is currently pre-v1. M0–M5 are implemented, including native
-> kernel-backed notifications for the configured root. Recursive watch-tree
-> registration is M6; nested changes still need periodic reconciliation as a
-> safety net until M6 is complete.
+> Version 1.0 implements the complete watcher-to-reconciliation path, recursive
+> watch registration, dirty-subtree batching, overflow recovery, persistent
+> snapshots, explicit integrity scrubbing, and cross-platform quality gates.
 
 ## Features
 
@@ -37,7 +36,10 @@ Expected state (optional) ─────┘
   metadata-invalid paths.
 - Concurrent in-memory snapshot store and a pluggable `SnapshotStore`
   interface.
+- Transactional persistent snapshots with `BoltStore` and restart recovery.
 - Configurable filtering, symlink policy, and hardlink policy.
+- Debounced DirtySet reconciliation that collapses overlapping subtrees.
+- Explicit SHA-256 integrity scrubbing outside watcher goroutines.
 - Bounded event delivery with observable drop statistics.
 - Context cancellation, clean shutdown, and periodic reconciliation.
 - No database, network, logging, or metrics-framework dependency in the core.
@@ -114,10 +116,9 @@ func main() {
 remain buffered and cause another reconciliation. Canceling its context or
 calling `Close` stops the tracker and closes both output channels.
 
-At M5, only `Root` itself is registered with the native backend. Direct-child
-changes are kernel-driven. Recursive registration of existing and newly created
-directories is M6; use `ReconcileInterval` when nested changes must be covered
-in the meantime.
+With `Recursive` enabled, existing and newly created directories are registered
+with the native backend before their children are scanned. `ReconcileInterval`
+is optional and serves only as a full-scan safety net.
 
 ## Run the demo
 
@@ -225,8 +226,8 @@ With an expected provider:
 - Actual paths absent from the manifest produce `Orphan`.
 - A size mismatch produces `Invalid`.
 
-`Fingerprint` is reserved for the integrity extension and is not evaluated by
-the current reconciler.
+`Fingerprint` is evaluated by `Tracker.Scrub` when an integrity checker is
+configured. Metadata reconciliation never hashes file contents.
 
 ## Event semantics
 
@@ -242,9 +243,9 @@ the current reconciler.
 | `ORPHAN` | An actual path is absent from expected state. |
 | `INVALID` | Actual metadata violates an expected constraint or policy. |
 
-`CORRUPT`, `OVERFLOW`, and `RESCAN_REQUIRED` are part of the public model for
-the integrity and watcher milestones but are not emitted by the current
-implementation.
+`CORRUPT` is emitted by an explicit integrity scrub. `OVERFLOW` and
+`RESCAN_REQUIRED` are emitted when native event history becomes unreliable,
+followed by a full reconciliation.
 
 Every event includes its semantic kind, current path, optional old path,
 optional before/after state, source, and observation time. Native OS event
@@ -257,12 +258,15 @@ types are never exposed.
 | `Root` | required | File or directory to reconcile. It is normalized to an absolute path. |
 | `Recursive` | `false` | Traverse descendants instead of only immediate children. |
 | `Expected` | `nil` | Optional expected-state provider. |
+| `Integrity` | `nil` | Optional checker used only by explicit `Scrub` calls. |
 | `Store` | `MemoryStore` | Snapshot store used across reconciliations. |
 | `Filter` | `nil` | Return `true` for paths that should be tracked. Filtering a directory prunes its subtree. |
 | `SymlinkPolicy` | `IgnoreSymlinks` | Ignore, report, follow, or reject symbolic links. |
 | `HardlinkPolicy` | `AllowHardlinks` | Allow, report as invalid, or reject regular files with multiple links. |
+| `DebounceWindow` | `100ms` | Quiet period used to coalesce raw notifications and dirty subtrees. |
 | `ReconcileInterval` | disabled | Optional safety interval between full reconciliations. Native root events remain active when disabled. |
 | `EventBuffer` | `256` | Capacity of the public semantic-event channel. |
+| `ReportEventLimit` | `10000` | Maximum detailed events retained by one report; counters remain complete. |
 
 The safe default is to ignore symlinks. Enable `FollowSymlinks` only when
 traversal outside the lexical root is acceptable for your application.
@@ -294,6 +298,40 @@ type SnapshotStore interface {
 
 `FileID` supports text marshaling so an opaque identity can be persisted without
 exposing inode, device, volume, or Windows file-index fields through the API.
+
+For durable state, use the included transactional store:
+
+```go
+store, err := fsrecon.OpenBoltStore("fsrecon.db")
+if err != nil {
+	return err
+}
+defer store.Close()
+
+tracker, err := fsrecon.New(fsrecon.Config{Root: "/data", Store: store})
+```
+
+## Integrity scrubbing
+
+Content verification is explicit and never runs on the native event-reader
+goroutine:
+
+```go
+tracker, err := fsrecon.New(fsrecon.Config{
+	Root:      "/data",
+	Recursive: true,
+	Expected:  manifest,
+	Integrity: fsrecon.SHA256Checker{},
+})
+if err != nil {
+	return err
+}
+
+report, err := tracker.Scrub(ctx)
+```
+
+Expected SHA-256 values belong in `ExpectedEntry.Fingerprint`. A mismatch emits
+`CORRUPT` with `SourceIntegrity`.
 
 ## Consistency model
 
@@ -327,12 +365,15 @@ Any active state -> STOPPED
 ```
 
 See [Consistency model](docs/consistency.md) and
-[Architecture](docs/architecture.md) for details.
+[Architecture](docs/architecture.md) for details. The public compatibility
+policy is documented in [Versioning](docs/versioning.md).
 
 ## Backpressure and statistics
 
-The event channel is bounded. A slow consumer does not block reconciliation;
-instead, excess events are dropped and recorded in `Stats`:
+The event channel and per-report detail are bounded. A slow consumer does not
+block reconciliation; instead, excess events are dropped and recorded in
+`Stats`. `ReconcileReport.EventsTruncated` reports detail omitted after
+`ReportEventLimit`, while aggregate counters remain complete:
 
 ```go
 stats := tracker.Stats()
@@ -350,9 +391,10 @@ returned `ReconcileReport` for that pass. The event stream is not a durable log.
 
 ## CLI
 
-The development CLI runs a one-shot reconciliation:
+The CLI supports native watching and one-shot reconciliation:
 
 ```bash
+go run ./cmd/fsrecon watch /data
 go run ./cmd/fsrecon reconcile /data
 ```
 
@@ -374,19 +416,26 @@ Scanned: 2  Healthy: 0  Missing: 0  Orphan: 0  Duration: 240.1µs
 | M3 — Memory snapshot store | Implemented |
 | M4 — Reconciliation engine | Implemented |
 | M5 — Native watcher backend | Implemented |
-| M6 — Recursive watch tree | Next |
-| M7+ — Normalization, DirtySet, overflow hardening | Planned |
-| Persistent stores and integrity checking | Planned |
+| M6 — Recursive watch tree | Implemented |
+| M7 — Normalization, debounce and coalescing | Implemented |
+| M8 — Dirty subtree reconciliation | Implemented |
+| M9 — Overflow and backpressure recovery | Implemented |
+| M10 — Persistent snapshot state | Implemented (`BoltStore`) |
+| M11 — Integrity extension | Implemented (`Scrub`, SHA-256) |
+| M12 — Cross-platform hardening | Implemented with semantic integration tests |
+| M13 — Benchmarks and performance baseline | Implemented |
 
 Current scalability characteristics:
 
 - The scanner streams entries and does not create a scanner-owned `[]FileState`.
-- The current reconciliation engine builds in-memory indexes for identity matching,
-  so a full pass currently uses O(N) memory.
+- Partial reconciliation uses O(K) working memory. `MemoryStore` full passes use
+  O(N) indexes; `BoltStore` full passes spill comparison indexes to temporary
+  disk and keep report detail bounded by `ReportEventLimit`.
 - Queues exposed by the tracker are bounded.
 - Content hashing is not performed during metadata reconciliation.
 
-See [Scalability](docs/scalability.md) and [Watch backends](docs/backends.md).
+See [Scalability](docs/scalability.md), [Benchmarks](docs/benchmarks.md), and
+[Watch backends](docs/backends.md).
 
 ## Development
 
@@ -395,6 +444,8 @@ Run the standard quality gates:
 ```bash
 make check
 make test-race
+make integration
+make bench
 ```
 
 Equivalent commands:
@@ -418,6 +469,7 @@ macOS, and Windows.
 ├── examples/             watcher, reconciliation, and expected-state examples
 ├── internal/backend/     native event abstraction and fsnotify adapter
 ├── internal/reconcile/   semantic diff engine
+├── internal/dirtyset/    prefix-trie dirty subtree collapse
 ├── internal/scanner/     filesystem traversal and platform identity
 ├── scripts/demo.sh       executable filesystem demo
 └── *.go                  small public package surface

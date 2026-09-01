@@ -20,6 +20,7 @@ const (
 	EventRescanRequired
 )
 
+// String returns the stable uppercase event name.
 func (k EventKind) String() string {
 	names := [...]string{
 		"CREATED", "MODIFIED", "DELETED", "MOVED", "ATTRIBUTE_CHANGED",
@@ -40,6 +41,7 @@ const (
 	SourceIntegrity
 )
 
+// String returns the stable uppercase source name.
 func (s EventSource) String() string {
 	names := [...]string{"WATCHER", "RECONCILE", "INTEGRITY"}
 	if int(s) >= len(names) {

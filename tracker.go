@@ -13,9 +13,14 @@ import (
 
 	internalbackend "github.com/thinhphan97/fsrecon/internal/backend"
 	fsnotifybackend "github.com/thinhphan97/fsrecon/internal/backend/fsnotify"
+	"github.com/thinhphan97/fsrecon/internal/debounce"
+	"github.com/thinhphan97/fsrecon/internal/dirtyset"
+	"github.com/thinhphan97/fsrecon/internal/normalize"
 	internalscanner "github.com/thinhphan97/fsrecon/internal/scanner"
+	"github.com/thinhphan97/fsrecon/internal/watchtree"
 )
 
+// TrackerState describes the current lifecycle and consistency state.
 type TrackerState uint8
 
 const (
@@ -36,6 +41,7 @@ func (s TrackerState) String() string {
 	return names[s]
 }
 
+// Tracker combines native notifications, scanning, snapshots, and reconciliation.
 type Tracker struct {
 	config Config
 	root   string
@@ -48,7 +54,10 @@ type Tracker struct {
 	cancel  context.CancelFunc
 
 	reconcileMu sync.Mutex
+	integrityMu sync.Mutex
 	backend     internalbackend.Backend
+	watchTree   *watchtree.Tree
+	newBackend  func(uint) internalbackend.Backend
 	events      chan Event
 	errors      chan error
 	closeOnce   sync.Once
@@ -57,14 +66,16 @@ type Tracker struct {
 }
 
 type trackerStats struct {
-	eventsReceived  atomic.Uint64
-	eventsCoalesced atomic.Uint64
-	eventsDropped   atomic.Uint64
-	reconciliations atomic.Uint64
-	filesScanned    atomic.Uint64
-	missingDetected atomic.Uint64
-	orphansDetected atomic.Uint64
-	dirtyPaths      atomic.Uint64
+	eventsReceived   atomic.Uint64
+	eventsCoalesced  atomic.Uint64
+	eventsDropped    atomic.Uint64
+	reconciliations  atomic.Uint64
+	filesScanned     atomic.Uint64
+	missingDetected  atomic.Uint64
+	orphansDetected  atomic.Uint64
+	dirtyPaths       atomic.Uint64
+	integrityScanned atomic.Uint64
+	corruptDetected  atomic.Uint64
 }
 
 // New validates config and constructs a tracker without touching the filesystem.
@@ -75,8 +86,14 @@ func New(config Config) (*Tracker, error) {
 	if config.EventBuffer < 0 {
 		return nil, errors.New("fsrecon: event buffer cannot be negative")
 	}
+	if config.ReportEventLimit < 0 {
+		return nil, errors.New("fsrecon: report event limit cannot be negative")
+	}
 	if config.ReconcileInterval < 0 {
 		return nil, errors.New("fsrecon: reconcile interval cannot be negative")
+	}
+	if config.DebounceWindow < 0 {
+		return nil, errors.New("fsrecon: debounce window cannot be negative")
 	}
 	if config.SymlinkPolicy > RejectSymlinks {
 		return nil, errors.New("fsrecon: invalid symlink policy")
@@ -95,10 +112,17 @@ func New(config Config) (*Tracker, error) {
 	if config.EventBuffer == 0 {
 		config.EventBuffer = defaultEventBuffer
 	}
+	if config.ReportEventLimit == 0 {
+		config.ReportEventLimit = defaultReportEventLimit
+	}
+	if config.DebounceWindow == 0 {
+		config.DebounceWindow = defaultDebounceWindow
+	}
 	return &Tracker{
 		config: config, root: config.Root, store: config.Store,
 		state: StateCreated, events: make(chan Event, config.EventBuffer),
-		errors: make(chan error, 16),
+		errors:     make(chan error, 16),
+		newBackend: func(buffer uint) internalbackend.Backend { return fsnotifybackend.New(buffer) },
 	}, nil
 }
 
@@ -123,7 +147,7 @@ func (t *Tracker) Start(ctx context.Context) error {
 	t.cancel = cancel
 	t.mu.Unlock()
 
-	native := fsnotifybackend.New(fsnotifybackend.DefaultBuffer)
+	native := t.newBackend(fsnotifybackend.DefaultBuffer)
 	if err := native.Start(runCtx, t.root); err != nil {
 		t.setState(StateDirty)
 		cancel()
@@ -131,6 +155,7 @@ func (t *Tracker) Start(ctx context.Context) error {
 	}
 	t.mu.Lock()
 	t.backend = native
+	t.watchTree = watchtree.New(t.root, native)
 	t.mu.Unlock()
 
 	t.setState(StateSyncing)
@@ -169,11 +194,14 @@ func (t *Tracker) run(ctx context.Context) {
 		defer ticker.Stop()
 	}
 	backendStoppedReported := false
+	dirty := dirtyset.New(t.root)
+	quiet := debounce.New(t.config.DebounceWindow)
+	defer quiet.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case _, ok := <-nativeEvents:
+		case raw, ok := <-nativeEvents:
 			if !ok {
 				nativeEvents = nil
 				if ctx.Err() == nil && !backendStoppedReported {
@@ -185,16 +213,40 @@ func (t *Tracker) run(ctx context.Context) {
 				continue
 			}
 			t.stats.eventsReceived.Add(1)
-			t.reconcileAfterHint(ctx)
+			hint, ok := normalize.Event(raw, t.root)
+			if !ok {
+				continue
+			}
+			if dirty.Add(hint.Scope) {
+				t.stats.dirtyPaths.Store(uint64(dirty.Len()))
+			} else {
+				t.stats.eventsCoalesced.Add(1)
+			}
+			quiet.Trigger()
 		case err, ok := <-nativeErrors:
 			if !ok {
 				nativeErrors = nil
 				continue
 			}
 			t.handleBackendError(ctx, err)
+		case <-quiet.C():
+			scopes := dirty.Drain()
+			t.stats.dirtyPaths.Store(0)
+			if len(scopes) > 0 {
+				t.reconcileScopesAfterHint(ctx, scopes)
+			}
 		case <-ticks:
+			dirty.Drain()
+			t.stats.dirtyPaths.Store(0)
+			quiet.Stop()
 			t.reconcileAfterHint(ctx)
 		}
+	}
+}
+
+func (t *Tracker) reconcileScopesAfterHint(ctx context.Context, scopes []string) {
+	if _, err := t.reconcileScopes(ctx, scopes); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrClosed) {
+		t.sendError(err)
 	}
 }
 
@@ -232,7 +284,9 @@ func (t *Tracker) stopFromContext() {
 	t.state = StateStopped
 	t.mu.Unlock()
 	t.reconcileMu.Lock()
+	t.integrityMu.Lock()
 	t.closeChannels()
+	t.integrityMu.Unlock()
 	t.reconcileMu.Unlock()
 }
 
@@ -243,7 +297,9 @@ func (t *Tracker) Close() error {
 		t.mu.Unlock()
 		t.wg.Wait()
 		t.reconcileMu.Lock()
+		t.integrityMu.Lock()
 		t.closeChannels()
+		t.integrityMu.Unlock()
 		t.reconcileMu.Unlock()
 		return nil
 	}
@@ -256,7 +312,9 @@ func (t *Tracker) Close() error {
 	}
 	t.wg.Wait()
 	t.reconcileMu.Lock()
+	t.integrityMu.Lock()
 	t.closeChannels()
+	t.integrityMu.Unlock()
 	t.reconcileMu.Unlock()
 	return nil
 }
@@ -268,9 +326,13 @@ func (t *Tracker) closeChannels() {
 	})
 }
 
+// Events returns the bounded semantic-event stream.
 func (t *Tracker) Events() <-chan Event { return t.events }
+
+// Errors returns asynchronous backend and reconciliation errors.
 func (t *Tracker) Errors() <-chan error { return t.errors }
 
+// State returns the current tracker lifecycle state.
 func (t *Tracker) State() TrackerState {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -285,13 +347,15 @@ func (t *Tracker) setState(state TrackerState) {
 	t.mu.Unlock()
 }
 
+// Stats returns a lock-free snapshot of counters and queue gauges.
 func (t *Tracker) Stats() Stats {
 	return Stats{
 		EventsReceived: t.stats.eventsReceived.Load(), EventsCoalesced: t.stats.eventsCoalesced.Load(),
 		EventsDropped: t.stats.eventsDropped.Load(), Reconciliations: t.stats.reconciliations.Load(),
 		FilesScanned: t.stats.filesScanned.Load(), MissingDetected: t.stats.missingDetected.Load(),
 		OrphansDetected: t.stats.orphansDetected.Load(), DirtyPaths: t.stats.dirtyPaths.Load(),
-		QueueDepth: uint64(len(t.events)),
+		QueueDepth: uint64(len(t.events)), IntegrityScanned: t.stats.integrityScanned.Load(),
+		CorruptDetected: t.stats.corruptDetected.Load(),
 	}
 }
 
