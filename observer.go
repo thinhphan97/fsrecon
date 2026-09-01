@@ -155,6 +155,10 @@ func (o *Observer) handleRaw(ctx context.Context, tree *watchtree.Tree, raw inte
 	}
 	wasWatched := tree != nil && tree.IsWatched(path)
 	if raw.Op&internalbackend.OpRemove != 0 {
+		if path == o.root {
+			o.degrade(ErrBackendStopped)
+			return
+		}
 		if tree != nil {
 			if err := tree.RemoveSubtree(path); err != nil {
 				o.degrade(err)
@@ -171,6 +175,10 @@ func (o *Observer) handleRaw(ctx context.Context, tree *watchtree.Tree, raw inte
 		return
 	}
 	if raw.Op&internalbackend.OpRename != 0 {
+		if path == o.root {
+			o.degrade(ErrBackendStopped)
+			return
+		}
 		if tree != nil {
 			if err := tree.RemoveSubtree(path); err != nil {
 				o.degrade(err)
