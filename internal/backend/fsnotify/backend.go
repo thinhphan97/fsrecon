@@ -8,7 +8,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	fsnotifylib "github.com/fsnotify/fsnotify"
@@ -102,14 +104,22 @@ func (b *Backend) Remove(path string) error {
 	}
 	if err := watcher.Remove(filepath.Clean(path)); err != nil {
 		// Windows resolves attributes while removing a watch and reports a
-		// PathError when the directory has already moved or disappeared. That
-		// is equivalent to fsnotify's non-existent-watch sentinel for cleanup.
-		if errors.Is(err, fsnotifylib.ErrNonExistentWatch) || errors.Is(err, fs.ErrNotExist) || os.IsNotExist(err) {
+		// PathError when the directory has already moved or disappeared. Linux
+		// invalidates the inotify descriptor implicitly and returns EINVAL.
+		// Both mean the requested cleanup has already happened.
+		if isRemovedWatchError(err) {
 			return nil
 		}
 		return fmt.Errorf("remove watch %q: %w", path, err)
 	}
 	return nil
+}
+
+func isRemovedWatchError(err error) bool {
+	return errors.Is(err, fsnotifylib.ErrNonExistentWatch) ||
+		errors.Is(err, fs.ErrNotExist) ||
+		os.IsNotExist(err) ||
+		(runtime.GOOS == "linux" && errors.Is(err, syscall.EINVAL))
 }
 
 func (b *Backend) Close() error {

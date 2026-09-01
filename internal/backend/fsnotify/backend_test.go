@@ -2,8 +2,11 @@ package fsnotify
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -78,5 +81,17 @@ func TestRemoveAlreadyDeletedDirectoryIsIdempotent(t *testing.T) {
 	}
 	if err := b.Remove(directory); err != nil {
 		t.Fatalf("Remove() after directory deletion = %v", err)
+	}
+}
+
+func TestRemovedWatchErrorPlatformSemantics(t *testing.T) {
+	if got, want := isRemovedWatchError(syscall.EINVAL), runtime.GOOS == "linux"; got != want {
+		t.Fatalf("isRemovedWatchError(EINVAL) = %v, want %v", got, want)
+	}
+	if !isRemovedWatchError(os.ErrNotExist) {
+		t.Fatal("isRemovedWatchError(os.ErrNotExist) = false")
+	}
+	if isRemovedWatchError(errors.New("backend failure")) {
+		t.Fatal("isRemovedWatchError(unrelated error) = true")
 	}
 }
