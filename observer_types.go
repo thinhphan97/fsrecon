@@ -93,7 +93,7 @@ type ObserverStats struct {
 	HintsCoalesced       uint64
 	OverflowCount        uint64
 	PendingHints         uint64
-	PublicHintsDropped   uint64
+	HintDeliveryDeferred uint64
 	WatchedDirectories   uint64
 }
 type observerStatsAtomic struct{ received, emitted, coalesced, overflows, dropped atomic.Uint64 }

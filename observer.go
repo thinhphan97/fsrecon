@@ -39,6 +39,9 @@ func NewObserver(config ObserverConfig) (*Observer, error) {
 	if config.Root == "" {
 		return nil, errors.New("fsrecon: observer root is required")
 	}
+	if config.SymlinkPolicy == FollowSymlinks {
+		return nil, ErrObserverFollowSymlinksUnsupported
+	}
 	if config.HintBuffer < 0 || config.MaxPendingHints < 0 || config.DebounceWindow < 0 {
 		return nil, errors.New("fsrecon: invalid observer limits")
 	}
@@ -72,6 +75,11 @@ func (o *Observer) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	o.cancel = cancel
 	o.mu.Unlock()
+	if info, err := os.Lstat(o.root); err == nil && info.Mode()&os.ModeSymlink != 0 && o.config.SymlinkPolicy == RejectSymlinks {
+		o.setState(ObserverDegraded)
+		cancel()
+		return ErrSymlink
+	}
 	b := o.newBackend(fsnotifybackend.DefaultBuffer)
 	if err := b.Start(runCtx, o.root); err != nil {
 		cancel()
@@ -162,7 +170,18 @@ func (o *Observer) handleRaw(ctx context.Context, tree *watchtree.Tree, raw inte
 		}
 	}
 	if o.config.Recursive && raw.Op&internalbackend.OpCreate != 0 {
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
+		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			if o.config.SymlinkPolicy == RejectSymlinks {
+				o.degrade(ErrSymlink)
+				return
+			}
+			if o.config.SymlinkPolicy != FollowSymlinks {
+				if o.config.Filter == nil || o.config.Filter(path) {
+					o.enqueue(Hint{Path: path, Scope: HintPath, Cause: HintNativeChange, Time: time.Now()})
+				}
+				return
+			}
+		} else if err == nil && info.IsDir() {
 			if err := tree.Add(path); err != nil {
 				o.degrade(err)
 				return
@@ -259,11 +278,20 @@ func (o *Observer) enqueue(h Hint) {
 		return
 	}
 	if len(o.pending) >= o.config.MaxPendingHints {
-		o.pending = map[string]Hint{}
-		o.rootPending = true
+		o.escalateRootLocked(HintNativeChange, h.Time)
 		return
 	}
 	o.pending[h.Path] = h
+}
+
+func (o *Observer) escalateRootLocked(cause HintCause, now time.Time) {
+	h := Hint{Path: o.root, Scope: HintSubtree, Cause: cause, Time: now}
+	if o.rootPending {
+		h.Cause = mergeHintCause(o.rootHint.Cause, cause)
+	}
+	o.rootHint = h
+	o.rootPending = true
+	o.pending = map[string]Hint{}
 }
 func (o *Observer) degrade(err error) {
 	o.setState(ObserverDegraded)
@@ -287,7 +315,7 @@ func (o *Observer) Hints() <-chan Hint   { return o.hints }
 func (o *Observer) Errors() <-chan error { return o.errors }
 func (o *Observer) State() ObserverState { o.mu.RLock(); defer o.mu.RUnlock(); return o.state }
 func (o *Observer) Stats() ObserverStats {
-	return ObserverStats{NativeEventsReceived: o.stats.received.Load(), HintsEmitted: o.stats.emitted.Load(), HintsCoalesced: o.stats.coalesced.Load(), OverflowCount: o.stats.overflows.Load(), PendingHints: o.pendingCount(), PublicHintsDropped: o.stats.dropped.Load(), WatchedDirectories: uint64(o.treeCount())}
+	return ObserverStats{NativeEventsReceived: o.stats.received.Load(), HintsEmitted: o.stats.emitted.Load(), HintsCoalesced: o.stats.coalesced.Load(), OverflowCount: o.stats.overflows.Load(), PendingHints: o.pendingCount(), HintDeliveryDeferred: o.stats.dropped.Load(), WatchedDirectories: uint64(o.treeCount())}
 }
 func (o *Observer) pendingCount() uint64 {
 	o.pendingMu.Lock()
