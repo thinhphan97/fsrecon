@@ -31,6 +31,7 @@ type Observer struct {
 	pendingMu   sync.Mutex
 	pending     map[string]Hint
 	rootPending bool
+	rootHint    Hint
 	stats       observerStatsAtomic
 }
 
@@ -82,7 +83,7 @@ func (o *Observer) Start(ctx context.Context) error {
 	o.backend, o.tree = b, tree
 	o.mu.Unlock()
 	if o.config.Recursive {
-		if err := walkObserverDirectories(runCtx, o.root, func(path string) error { return tree.Add(path) }); err != nil {
+		if err := walkObserverDirectoriesPolicy(runCtx, o.root, o.config.SymlinkPolicy, func(path string) error { return tree.Add(path) }); err != nil {
 			_ = b.Close()
 			cancel()
 			o.setState(ObserverDegraded)
@@ -94,6 +95,7 @@ func (o *Observer) Start(ctx context.Context) error {
 	o.wg.Add(2)
 	go o.collect(runCtx)
 	go o.emit(runCtx)
+	go func() { <-runCtx.Done(); _ = o.Close() }()
 	return nil
 }
 
@@ -125,6 +127,12 @@ func (o *Observer) collect(ctx context.Context) {
 			}
 			if errors.Is(err, internalbackend.ErrOverflow) {
 				o.stats.overflows.Add(1)
+				if o.config.Recursive {
+					if syncErr := o.resyncWatchTree(ctx); syncErr != nil {
+						o.degrade(syncErr)
+						continue
+					}
+				}
 				o.enqueue(Hint{Path: o.root, Scope: HintSubtree, Cause: HintOverflow, Time: time.Now()})
 			}
 			o.sendError(err)
@@ -139,13 +147,30 @@ func (o *Observer) handleRaw(ctx context.Context, tree *watchtree.Tree, raw inte
 	}
 	if raw.Op&internalbackend.OpRemove != 0 || raw.Op&internalbackend.OpRename != 0 {
 		if tree != nil {
-			_ = tree.RemoveSubtree(path)
+			if err := tree.RemoveSubtree(path); err != nil {
+				o.degrade(err)
+				return
+			}
+		}
+		if raw.Op&internalbackend.OpRename != 0 {
+			if err := o.resyncWatchTree(ctx); err != nil {
+				o.degrade(err)
+				return
+			}
+			o.enqueue(Hint{Path: filepath.Dir(path), Scope: HintSubtree, Cause: HintNativeChange, Time: time.Now()})
+			return
 		}
 	}
 	if o.config.Recursive && raw.Op&internalbackend.OpCreate != 0 {
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			_ = tree.Add(path)
-			_ = walkObserverDirectories(ctx, path, func(p string) error { return tree.Add(p) })
+			if err := tree.Add(path); err != nil {
+				o.degrade(err)
+				return
+			}
+			if err := walkObserverDirectoriesPolicy(ctx, path, o.config.SymlinkPolicy, func(p string) error { return tree.Add(p) }); err != nil {
+				o.degrade(err)
+				return
+			}
 			o.enqueue(Hint{Path: path, Scope: HintSubtree, Cause: HintNativeChange, Time: time.Now()})
 			return
 		}
@@ -173,7 +198,7 @@ func (o *Observer) flush() {
 	o.pendingMu.Lock()
 	defer o.pendingMu.Unlock()
 	if o.rootPending {
-		if o.trySend(Hint{Path: o.root, Scope: HintSubtree, Cause: HintNativeChange, Time: time.Now()}) {
+		if o.trySend(o.rootHint) {
 			o.rootPending = false
 		}
 		return
@@ -184,6 +209,25 @@ func (o *Observer) flush() {
 		}
 		delete(o.pending, path)
 	}
+}
+func mergeHintCause(a, b HintCause) HintCause {
+	if b > a {
+		return b
+	}
+	return a
+}
+func (o *Observer) resyncWatchTree(ctx context.Context) error {
+	if !o.config.Recursive {
+		return nil
+	}
+	o.mu.RLock()
+	tree := o.tree
+	o.mu.RUnlock()
+	observed := map[string]struct{}{}
+	if err := walkObserverDirectoriesPolicy(ctx, o.root, o.config.SymlinkPolicy, func(path string) error { observed[path] = struct{}{}; return tree.Add(path) }); err != nil {
+		return err
+	}
+	return tree.Sync([]string{o.root}, observed)
 }
 func (o *Observer) trySend(h Hint) bool {
 	select {
@@ -199,6 +243,10 @@ func (o *Observer) enqueue(h Hint) {
 	o.pendingMu.Lock()
 	defer o.pendingMu.Unlock()
 	if h.Scope == HintSubtree && h.Path == o.root {
+		if o.rootPending {
+			h.Cause = mergeHintCause(o.rootHint.Cause, h.Cause)
+		}
+		o.rootHint = h
 		o.rootPending = true
 		o.pending = map[string]Hint{}
 		return
@@ -283,6 +331,9 @@ func withinObserver(root, path string) bool {
 	return err == nil && rel != ".." && !(len(rel) >= 3 && rel[:3] == ".."+string(filepath.Separator))
 }
 func walkObserverDirectories(ctx context.Context, root string, fn func(string) error) error {
+	return walkObserverDirectoriesPolicy(ctx, root, ReportSymlinks, fn)
+}
+func walkObserverDirectoriesPolicy(ctx context.Context, root string, policy SymlinkPolicy, fn func(string) error) error {
 	info, err := os.Stat(root)
 	if err != nil {
 		return err
@@ -296,6 +347,14 @@ func walkObserverDirectories(ctx context.Context, root string, fn func(string) e
 		}
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			if policy == RejectSymlinks {
+				return ErrSymlink
+			}
+			if policy != FollowSymlinks {
+				return filepath.SkipDir
+			}
 		}
 		if path == root {
 			return fn(path)

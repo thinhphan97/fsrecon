@@ -23,10 +23,13 @@ const (
 )
 
 func (s HintScope) String() string {
-	if s == HintSubtree {
+	switch s {
+	case HintPath:
+		return "PATH"
+	case HintSubtree:
 		return "SUBTREE"
 	}
-	return "PATH"
+	return "UNKNOWN"
 }
 
 type HintCause uint8
@@ -39,7 +42,17 @@ const (
 )
 
 func (c HintCause) String() string {
-	return [...]string{"NATIVE_CHANGE", "STARTUP", "OVERFLOW", "BACKEND_STOPPED"}[minInt(int(c), 3)]
+	switch c {
+	case HintNativeChange:
+		return "NATIVE_CHANGE"
+	case HintStartup:
+		return "STARTUP"
+	case HintOverflow:
+		return "OVERFLOW"
+	case HintBackendStopped:
+		return "BACKEND_STOPPED"
+	}
+	return "UNKNOWN"
 }
 
 type Hint struct {
@@ -58,6 +71,22 @@ const (
 	ObserverStopped
 )
 
+func (s ObserverState) String() string {
+	switch s {
+	case ObserverCreated:
+		return "CREATED"
+	case ObserverStarting:
+		return "STARTING"
+	case ObserverRunning:
+		return "RUNNING"
+	case ObserverDegraded:
+		return "DEGRADED"
+	case ObserverStopped:
+		return "STOPPED"
+	}
+	return "UNKNOWN"
+}
+
 type ObserverStats struct {
 	NativeEventsReceived uint64
 	HintsEmitted         uint64
@@ -68,10 +97,3 @@ type ObserverStats struct {
 	WatchedDirectories   uint64
 }
 type observerStatsAtomic struct{ received, emitted, coalesced, overflows, dropped atomic.Uint64 }
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
