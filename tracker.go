@@ -31,14 +31,30 @@ const (
 	StateDirty
 	StateReconciling
 	StateStopped
+	StateDegraded
 )
 
 func (s TrackerState) String() string {
-	names := [...]string{"CREATED", "STARTING", "SYNCING", "SYNCED", "DIRTY", "RECONCILING", "STOPPED"}
-	if int(s) >= len(names) {
+	switch s {
+	case StateCreated:
+		return "CREATED"
+	case StateStarting:
+		return "STARTING"
+	case StateSyncing:
+		return "SYNCING"
+	case StateSynced:
+		return "SYNCED"
+	case StateDirty:
+		return "DIRTY"
+	case StateReconciling:
+		return "RECONCILING"
+	case StateStopped:
+		return "STOPPED"
+	case StateDegraded:
+		return "DEGRADED"
+	default:
 		return "UNKNOWN"
 	}
-	return names[s]
 }
 
 // Tracker combines native notifications, scanning, snapshots, and reconciliation.
@@ -47,35 +63,41 @@ type Tracker struct {
 	root   string
 	store  SnapshotStore
 
-	mu      sync.RWMutex
-	state   TrackerState
-	started bool
-	closed  bool
-	cancel  context.CancelFunc
+	mu             sync.RWMutex
+	state          TrackerState
+	started        bool
+	closed         bool
+	backendHealthy bool
+	cancel         context.CancelFunc
 
-	reconcileMu sync.Mutex
-	integrityMu sync.Mutex
-	backend     internalbackend.Backend
-	watchTree   *watchtree.Tree
-	newBackend  func(uint) internalbackend.Backend
-	events      chan Event
-	errors      chan error
-	closeOnce   sync.Once
-	wg          sync.WaitGroup
-	stats       trackerStats
+	reconcileMu  sync.Mutex
+	integrityMu  sync.Mutex
+	backend      internalbackend.Backend
+	watchTree    *watchtree.Tree
+	newBackend   func(uint) internalbackend.Backend
+	events       chan Event
+	errors       chan error
+	closeOnce    sync.Once
+	wg           sync.WaitGroup
+	stats        trackerStats
+	generation   atomic.Uint64
+	dirtyPending atomic.Bool
 }
 
 type trackerStats struct {
-	eventsReceived   atomic.Uint64
-	eventsCoalesced  atomic.Uint64
-	eventsDropped    atomic.Uint64
-	reconciliations  atomic.Uint64
-	filesScanned     atomic.Uint64
-	missingDetected  atomic.Uint64
-	orphansDetected  atomic.Uint64
-	dirtyPaths       atomic.Uint64
-	integrityScanned atomic.Uint64
-	corruptDetected  atomic.Uint64
+	eventsReceived        atomic.Uint64
+	eventsCoalesced       atomic.Uint64
+	reconciliations       atomic.Uint64
+	filesScanned          atomic.Uint64
+	missingDetected       atomic.Uint64
+	orphansDetected       atomic.Uint64
+	dirtyPaths            atomic.Uint64
+	integrityScanned      atomic.Uint64
+	corruptDetected       atomic.Uint64
+	publicEventsDropped   atomic.Uint64
+	reportEventsTruncated atomic.Uint64
+	nativeEventsDropped   atomic.Uint64
+	backendOverflows      atomic.Uint64
 }
 
 // New validates config and constructs a tracker without touching the filesystem.
@@ -89,6 +111,9 @@ func New(config Config) (*Tracker, error) {
 	if config.ReportEventLimit < 0 {
 		return nil, errors.New("fsrecon: report event limit cannot be negative")
 	}
+	if config.ChangeBatchSize < 0 {
+		return nil, errors.New("fsrecon: change batch size cannot be negative")
+	}
 	if config.ReconcileInterval < 0 {
 		return nil, errors.New("fsrecon: reconcile interval cannot be negative")
 	}
@@ -100,6 +125,9 @@ func New(config Config) (*Tracker, error) {
 	}
 	if config.HardlinkPolicy > RejectHardlinks {
 		return nil, errors.New("fsrecon: invalid hardlink policy")
+	}
+	if config.ExpectedScope > ExpectedAllEntries {
+		return nil, errors.New("fsrecon: invalid expected entry scope")
 	}
 	root, err := filepath.Abs(config.Root)
 	if err != nil {
@@ -114,6 +142,9 @@ func New(config Config) (*Tracker, error) {
 	}
 	if config.ReportEventLimit == 0 {
 		config.ReportEventLimit = defaultReportEventLimit
+	}
+	if config.ChangeBatchSize == 0 {
+		config.ChangeBatchSize = defaultChangeBatchSize
 	}
 	if config.DebounceWindow == 0 {
 		config.DebounceWindow = defaultDebounceWindow
@@ -156,25 +187,27 @@ func (t *Tracker) Start(ctx context.Context) error {
 	t.mu.Lock()
 	t.backend = native
 	t.watchTree = watchtree.New(t.root, native)
+	t.backendHealthy = true
 	t.mu.Unlock()
 
 	t.setState(StateSyncing)
+	t.wg.Add(1)
+	go t.run(runCtx)
 	if _, err := t.Reconcile(runCtx); err != nil {
 		t.setState(StateDirty)
 		cancel()
-		_ = native.Close()
+		t.wg.Wait()
 		return err
 	}
-
-	t.wg.Add(1)
-	go t.run(runCtx)
 	return nil
 }
 
 func (t *Tracker) run(ctx context.Context) {
 	defer t.wg.Done()
-	defer t.stopFromContext()
-	defer t.closeBackend()
+	defer func() {
+		t.closeBackend()
+		t.stopFromContext()
+	}()
 
 	t.mu.RLock()
 	native := t.backend
@@ -193,8 +226,49 @@ func (t *Tracker) run(ctx context.Context) {
 		ticks = ticker.C
 		defer ticker.Stop()
 	}
-	backendStoppedReported := false
 	dirty := dirtyset.New(t.root)
+	var dirtyMu sync.Mutex
+	reconcileWake := make(chan struct{}, 1)
+	workerDone := make(chan struct{})
+	addDirty := func(path string) {
+		dirtyMu.Lock()
+		changed := dirty.Add(path)
+		count := dirty.Len()
+		dirtyMu.Unlock()
+		t.dirtyPending.Store(count > 0)
+		t.stats.dirtyPaths.Store(uint64(count))
+		if !changed {
+			t.stats.eventsCoalesced.Add(1)
+		}
+		t.markDirty()
+	}
+	wakeReconciler := func() {
+		select {
+		case reconcileWake <- struct{}{}:
+		default:
+		}
+	}
+	go func() {
+		defer close(workerDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reconcileWake:
+				dirtyMu.Lock()
+				scopes := dirty.Drain()
+				t.stats.dirtyPaths.Store(0)
+				t.dirtyPending.Store(false)
+				dirtyMu.Unlock()
+				if len(scopes) > 0 {
+					t.reconcileScopesAfterHint(ctx, scopes)
+				}
+			}
+		}
+	}()
+	defer func() { <-workerDone }()
+
+	backendStoppedReported := false
 	quiet := debounce.New(t.config.DebounceWindow)
 	defer quiet.Stop()
 	for {
@@ -206,9 +280,10 @@ func (t *Tracker) run(ctx context.Context) {
 				nativeEvents = nil
 				if ctx.Err() == nil && !backendStoppedReported {
 					backendStoppedReported = true
-					t.setState(StateDirty)
+					t.markBackendUnhealthy()
 					t.sendError(ErrBackendStopped)
-					t.reconcileAfterHint(ctx)
+					addDirty(t.root)
+					wakeReconciler()
 				}
 				continue
 			}
@@ -217,29 +292,22 @@ func (t *Tracker) run(ctx context.Context) {
 			if !ok {
 				continue
 			}
-			if dirty.Add(hint.Scope) {
-				t.stats.dirtyPaths.Store(uint64(dirty.Len()))
-			} else {
-				t.stats.eventsCoalesced.Add(1)
-			}
+			addDirty(hint.Scope)
 			quiet.Trigger()
 		case err, ok := <-nativeErrors:
 			if !ok {
 				nativeErrors = nil
 				continue
 			}
-			t.handleBackendError(ctx, err)
+			t.handleBackendError(err)
+			addDirty(t.root)
+			wakeReconciler()
 		case <-quiet.C():
-			scopes := dirty.Drain()
-			t.stats.dirtyPaths.Store(0)
-			if len(scopes) > 0 {
-				t.reconcileScopesAfterHint(ctx, scopes)
-			}
+			wakeReconciler()
 		case <-ticks:
-			dirty.Drain()
-			t.stats.dirtyPaths.Store(0)
 			quiet.Stop()
-			t.reconcileAfterHint(ctx)
+			addDirty(t.root)
+			wakeReconciler()
 		}
 	}
 }
@@ -250,21 +318,15 @@ func (t *Tracker) reconcileScopesAfterHint(ctx context.Context, scopes []string)
 	}
 }
 
-func (t *Tracker) reconcileAfterHint(ctx context.Context) {
-	if _, err := t.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrClosed) {
-		t.sendError(err)
-	}
-}
-
-func (t *Tracker) handleBackendError(ctx context.Context, err error) {
-	t.setState(StateDirty)
+func (t *Tracker) handleBackendError(err error) {
+	t.markDirty()
 	t.sendError(fmt.Errorf("fsrecon: native watcher: %w", err))
 	if errors.Is(err, internalbackend.ErrOverflow) {
+		t.stats.backendOverflows.Add(1)
 		now := time.Now()
 		t.sendEvent(Event{Kind: EventOverflow, Path: t.root, Source: SourceWatcher, Time: now})
 		t.sendEvent(Event{Kind: EventRescanRequired, Path: t.root, Source: SourceWatcher, Time: now})
 	}
-	t.reconcileAfterHint(ctx)
 }
 
 func (t *Tracker) closeBackend() {
@@ -347,12 +409,52 @@ func (t *Tracker) setState(state TrackerState) {
 	t.mu.Unlock()
 }
 
+func (t *Tracker) markBackendUnhealthy() {
+	t.mu.Lock()
+	if !t.closed {
+		t.backendHealthy = false
+		t.state = StateDegraded
+	}
+	t.mu.Unlock()
+}
+
+func (t *Tracker) markDirty() {
+	t.mu.Lock()
+	if !t.closed {
+		if t.started && !t.backendHealthy {
+			t.state = StateDegraded
+		} else {
+			t.state = StateDirty
+		}
+	}
+	t.mu.Unlock()
+}
+
+func (t *Tracker) setConsistentState() {
+	t.mu.Lock()
+	if !t.closed {
+		switch {
+		case t.started && !t.backendHealthy:
+			t.state = StateDegraded
+		case t.dirtyPending.Load():
+			t.state = StateDirty
+		default:
+			t.state = StateSynced
+		}
+	}
+	t.mu.Unlock()
+}
+
 // Stats returns a lock-free snapshot of counters and queue gauges.
 func (t *Tracker) Stats() Stats {
+	publicDropped := t.stats.publicEventsDropped.Load()
 	return Stats{
 		EventsReceived: t.stats.eventsReceived.Load(), EventsCoalesced: t.stats.eventsCoalesced.Load(),
-		EventsDropped: t.stats.eventsDropped.Load(), Reconciliations: t.stats.reconciliations.Load(),
-		FilesScanned: t.stats.filesScanned.Load(), MissingDetected: t.stats.missingDetected.Load(),
+		EventsDropped: publicDropped, PublicEventsDropped: publicDropped,
+		ReportEventsTruncated: t.stats.reportEventsTruncated.Load(),
+		NativeEventsDropped:   t.stats.nativeEventsDropped.Load(), BackendOverflows: t.stats.backendOverflows.Load(),
+		Reconciliations: t.stats.reconciliations.Load(),
+		FilesScanned:    t.stats.filesScanned.Load(), MissingDetected: t.stats.missingDetected.Load(),
 		OrphansDetected: t.stats.orphansDetected.Load(), DirtyPaths: t.stats.dirtyPaths.Load(),
 		QueueDepth: uint64(len(t.events)), IntegrityScanned: t.stats.integrityScanned.Load(),
 		CorruptDetected: t.stats.corruptDetected.Load(),
@@ -363,7 +465,7 @@ func (t *Tracker) sendEvent(event Event) {
 	select {
 	case t.events <- event:
 	default:
-		t.stats.eventsDropped.Add(1)
+		t.stats.publicEventsDropped.Add(1)
 	}
 }
 
@@ -375,7 +477,18 @@ func (t *Tracker) sendError(err error) {
 }
 
 func scannerPolicy(policy SymlinkPolicy) internalscanner.SymlinkPolicy {
-	return internalscanner.SymlinkPolicy(policy)
+	switch policy {
+	case IgnoreSymlinks:
+		return internalscanner.IgnoreSymlinks
+	case ReportSymlinks:
+		return internalscanner.ReportSymlinks
+	case FollowSymlinks:
+		return internalscanner.FollowSymlinks
+	case RejectSymlinks:
+		return internalscanner.RejectSymlinks
+	default:
+		return internalscanner.IgnoreSymlinks
+	}
 }
 
 func fileType(mode fs.FileMode) FileType {

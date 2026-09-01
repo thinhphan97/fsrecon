@@ -8,10 +8,14 @@ import (
 	"syscall"
 )
 
-func fileIdentity(path string, _ fs.FileInfo) (string, uint64, error) {
+func fileIdentity(path string, _ fs.FileInfo, followSymlink bool) (string, uint64, error) {
 	ptr, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		return "", 0, err
+	}
+	flags := uint32(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS
+	if !followSymlink {
+		flags |= 0x00200000 // FILE_FLAG_OPEN_REPARSE_POINT
 	}
 	handle, err := syscall.CreateFile(
 		ptr,
@@ -19,7 +23,7 @@ func fileIdentity(path string, _ fs.FileInfo) (string, uint64, error) {
 		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
 		nil,
 		syscall.OPEN_EXISTING,
-		0x02000000|0x00200000, // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+		flags,
 		0,
 	)
 	if err != nil {

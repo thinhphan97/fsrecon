@@ -4,6 +4,17 @@
 reconciliation scans current filesystem metadata, reads optional expected state,
 computes semantic changes, then applies the new snapshot.
 
+When `ChangeSink` is configured, the ordering is:
+
+```text
+scan -> complete diff -> deliver all ChangeBatch values -> commit snapshot
+```
+
+A sink error prevents snapshot commit, leaves the tracker dirty, and allows the
+same changes to be regenerated. Delivery is at-least-once: a store failure
+after successful delivery can cause the same generation and sequence to be
+retried, so sinks must be idempotent and use `Final` as the generation boundary.
+
 Watcher delivery is not a correctness boundary. Each native notification
 triggers reconciliation rather than being translated directly into a public
 semantic event. Lost, coalesced or overflowing notifications cause a full
@@ -21,11 +32,26 @@ store that only implements `SnapshotStore` is updated entry by entry; an error
 can leave a partial snapshot, and the next full reconciliation restores
 convergence.
 
-Raw events are normalized to parent-directory scopes, coalesced through the
+Raw events are drained by a dedicated collector, normalized to
+parent-directory scopes, coalesced through the
 debounce window, and collapsed by DirtySet before reconciliation. Moves across
 two dirty subtrees are compared in one batch so identity-based `Moved` semantics
 are preserved.
 
 The public event channel is bounded and is not a durable change log. If it
-fills, `Stats.EventsDropped` increases. Applications that require durable
-delivery must persist `ReconcileReport` results in their own domain.
+fills, `Stats.PublicEventsDropped` and its compatibility alias `EventsDropped`
+increase. Report truncation is independently visible through
+`EventsTruncated` and `Stats.ReportEventsTruncated`; neither affects
+`ChangeSink` delivery.
+
+If the native event channel closes unexpectedly, the tracker enters
+`StateDegraded`. Reconciliation can establish current filesystem truth but does
+not restore continuous observation, so the state remains degraded. The current
+implementation does not automatically restart a dead backend; create a new
+tracker to restore observation. With `ReconcileInterval == 0`, callers must not
+treat a degraded tracker as continuously monitored.
+
+Expected state defaults to regular-file-manifest semantics. Unlisted actual
+directories are not orphans, while a typeless expected entry implies a regular
+file. Explicit `ExpectedEntry.Type` constraints can reconcile directories and
+other entry types; `ExpectedAllEntries` enables orphan detection for all types.

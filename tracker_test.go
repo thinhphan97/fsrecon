@@ -6,14 +6,91 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	internalreconcile "github.com/thinhphan97/fsrecon/internal/reconcile"
 )
 
 type expectedProviderFunc func(context.Context, string, func(ExpectedEntry) error) error
 
 func (fn expectedProviderFunc) WalkExpected(ctx context.Context, root string, emit func(ExpectedEntry) error) error {
 	return fn(ctx, root, emit)
+}
+
+type countingScopedExpectedProvider struct {
+	mu          sync.Mutex
+	entries     []ExpectedEntry
+	fullCalls   int
+	scopedCalls int
+	emitted     int
+}
+
+func (p *countingScopedExpectedProvider) WalkExpected(_ context.Context, _ string, emit func(ExpectedEntry) error) error {
+	p.mu.Lock()
+	p.fullCalls++
+	entries := append([]ExpectedEntry(nil), p.entries...)
+	p.mu.Unlock()
+	for _, entry := range entries {
+		if err := emit(entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *countingScopedExpectedProvider) WalkExpectedScope(_ context.Context, root, scope string, emit func(ExpectedEntry) error) error {
+	p.mu.Lock()
+	p.scopedCalls++
+	entries := append([]ExpectedEntry(nil), p.entries...)
+	p.mu.Unlock()
+	for _, entry := range entries {
+		path := entry.Path
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(root, path)
+		}
+		if !pathHasPrefix(path, scope) {
+			continue
+		}
+		p.mu.Lock()
+		p.emitted++
+		p.mu.Unlock()
+		if err := emit(entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type countingScopedStore struct {
+	*MemoryStore
+	mu            sync.Mutex
+	fullCalls     int
+	scopedCalls   int
+	unrelatedRoot string
+	unrelatedSeen int
+}
+
+func (s *countingScopedStore) Walk(ctx context.Context, prefix string, fn func(FileState) error) error {
+	s.mu.Lock()
+	s.fullCalls++
+	s.mu.Unlock()
+	return s.MemoryStore.Walk(ctx, prefix, fn)
+}
+
+func (s *countingScopedStore) WalkScope(ctx context.Context, scope string, fn func(FileState) error) error {
+	s.mu.Lock()
+	s.scopedCalls++
+	s.mu.Unlock()
+	return s.MemoryStore.WalkScope(ctx, scope, func(state FileState) error {
+		if pathHasPrefix(state.Path, s.unrelatedRoot) {
+			s.mu.Lock()
+			s.unrelatedSeen++
+			s.mu.Unlock()
+		}
+		return fn(state)
+	})
 }
 
 func TestTrackerManualReconcileAndIdentity(t *testing.T) {
@@ -81,6 +158,53 @@ func TestTrackerManualReconcileAndIdentity(t *testing.T) {
 	}
 	if _, err := tracker.Reconcile(context.Background()); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Reconcile() after close error = %v", err)
+	}
+}
+
+func TestInternalEventKindMappingsAreExplicit(t *testing.T) {
+	tests := []struct {
+		internal internalreconcile.Kind
+		public   EventKind
+	}{
+		{internalreconcile.Created, EventCreated},
+		{internalreconcile.Modified, EventModified},
+		{internalreconcile.Deleted, EventDeleted},
+		{internalreconcile.Moved, EventMoved},
+		{internalreconcile.AttributeChanged, EventAttributeChanged},
+		{internalreconcile.Missing, EventMissing},
+		{internalreconcile.Orphan, EventOrphan},
+		{internalreconcile.Replaced, EventReplaced},
+		{internalreconcile.Invalid, EventInvalid},
+	}
+	for _, test := range tests {
+		got, err := eventKindFromInternal(test.internal)
+		if err != nil || got != test.public {
+			t.Fatalf("eventKindFromInternal(%d) = (%v, %v), want %v", test.internal, got, err, test.public)
+		}
+	}
+	if _, err := eventKindFromInternal(internalreconcile.Kind(255)); err == nil {
+		t.Fatal("unknown internal event kind did not return an error")
+	}
+}
+
+func TestInternalFileTypeMappingsAreExplicit(t *testing.T) {
+	tests := []struct {
+		internal internalreconcile.FileType
+		public   FileType
+	}{
+		{internalreconcile.TypeUnknown, FileTypeUnknown},
+		{internalreconcile.TypeRegular, FileTypeRegular},
+		{internalreconcile.TypeDirectory, FileTypeDirectory},
+		{internalreconcile.TypeSymlink, FileTypeSymlink},
+		{internalreconcile.TypeOther, FileTypeOther},
+	}
+	for _, test := range tests {
+		if got := fileTypeFromInternal(test.internal); got != test.public {
+			t.Fatalf("fileTypeFromInternal(%d) = %v, want %v", test.internal, got, test.public)
+		}
+		if got := internalTypeFromPublic(test.public); got != test.internal {
+			t.Fatalf("internalTypeFromPublic(%v) = %d, want %d", test.public, got, test.internal)
+		}
 	}
 }
 
@@ -231,6 +355,82 @@ func TestPartialReconcileScansOnlyDirtySubtree(t *testing.T) {
 	}
 }
 
+func TestPartialReconcileUsesScopedExpectedProvider(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a")
+	b := filepath.Join(root, "b")
+	if err := os.MkdirAll(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(a, "file"), filepath.Join(b, "file")} {
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	provider := &countingScopedExpectedProvider{entries: []ExpectedEntry{
+		{Path: filepath.Join("a", "file")}, {Path: filepath.Join("b", "file")},
+	}}
+	tracker, err := New(Config{Root: root, Recursive: true, Expected: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	if _, err := tracker.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	provider.mu.Lock()
+	provider.fullCalls, provider.scopedCalls, provider.emitted = 0, 0, 0
+	provider.mu.Unlock()
+	if _, err := tracker.reconcileScopes(context.Background(), []string{a}); err != nil {
+		t.Fatal(err)
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.fullCalls != 0 || provider.scopedCalls != 1 || provider.emitted != 1 {
+		t.Fatalf("provider calls: full=%d scoped=%d emitted=%d", provider.fullCalls, provider.scopedCalls, provider.emitted)
+	}
+}
+
+func TestPartialReconcileUsesScopedSnapshotStore(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a")
+	b := filepath.Join(root, "b")
+	if err := os.MkdirAll(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(a, "file"), filepath.Join(b, "file")} {
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := &countingScopedStore{MemoryStore: NewMemoryStore(), unrelatedRoot: b}
+	tracker, err := New(Config{Root: root, Recursive: true, Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	if _, err := tracker.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.fullCalls, store.scopedCalls, store.unrelatedSeen = 0, 0, 0
+	store.mu.Unlock()
+	if _, err := tracker.reconcileScopes(context.Background(), []string{a}); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.fullCalls != 0 || store.scopedCalls != 1 || store.unrelatedSeen != 0 {
+		t.Fatalf("store calls: full=%d scoped=%d unrelated=%d", store.fullCalls, store.scopedCalls, store.unrelatedSeen)
+	}
+}
+
 func waitForEvent(t *testing.T, tracker *Tracker, kind EventKind, path, oldPath string) Event {
 	t.Helper()
 	timer := time.NewTimer(5 * time.Second)
@@ -278,6 +478,77 @@ func TestTrackerExpectedMissingOrphanInvalid(t *testing.T) {
 		t.Fatalf("report = %+v", report)
 	}
 	_ = tracker.Close()
+}
+
+func TestExpectedFileManifestDoesNotOrphanParentDirectories(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "objects")
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "a.dat"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	provider := expectedProviderFunc(func(_ context.Context, _ string, emit func(ExpectedEntry) error) error {
+		return emit(ExpectedEntry{Path: filepath.Join("objects", "a.dat")})
+	})
+	tracker, err := New(Config{Root: root, Recursive: true, Expected: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	report, err := tracker.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Healthy != 1 || report.Orphan != 0 || report.Invalid != 0 {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestExpectedTypeMismatchIsInvalid(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	provider := expectedProviderFunc(func(_ context.Context, _ string, emit func(ExpectedEntry) error) error {
+		return emit(ExpectedEntry{Path: "a"}) // Default expected type is regular file.
+	})
+	tracker, err := New(Config{Root: root, Recursive: true, Expected: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	report, err := tracker.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Invalid != 1 || report.Healthy != 0 || report.Orphan != 0 {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestExpectedDirectoryCanBeExplicit(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "directory"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	directoryType := FileTypeDirectory
+	provider := expectedProviderFunc(func(_ context.Context, _ string, emit func(ExpectedEntry) error) error {
+		return emit(ExpectedEntry{Path: "directory", Type: &directoryType})
+	})
+	tracker, err := New(Config{Root: root, Recursive: true, Expected: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	report, err := tracker.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Healthy != 1 || report.Invalid != 0 || report.Orphan != 0 {
+		t.Fatalf("report = %+v", report)
+	}
 }
 
 func TestTrackerContextCancellationClosesChannels(t *testing.T) {

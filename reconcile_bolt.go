@@ -2,6 +2,7 @@ package fsrecon
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,12 +21,13 @@ var (
 	workActualID   = []byte("actual-id")
 	workExpected   = []byte("expected")
 	workMatched    = []byte("matched-previous")
+	workChanges    = []byte("changes")
 )
 
 func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, report ReconcileReport) (ReconcileReport, error) {
 	fail := func(err error) (ReconcileReport, error) {
 		report.Duration = time.Since(report.StartedAt)
-		t.setState(StateDirty)
+		t.markDirty()
 		return report, err
 	}
 	temporary, err := os.CreateTemp("", "fsrecon-reconcile-*.db")
@@ -44,7 +46,7 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 	}
 	defer index.Close()
 	if err := index.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{workPrevious, workActual, workPreviousID, workActualID, workExpected, workMatched} {
+		for _, name := range [][]byte{workPrevious, workActual, workPreviousID, workActualID, workExpected, workMatched, workChanges} {
 			if _, err := tx.CreateBucket(name); err != nil {
 				return err
 			}
@@ -75,6 +77,7 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 	if err := index.Update(func(tx *bolt.Tx) error {
 		actual := tx.Bucket(workActual)
 		identities := tx.Bucket(workActualID)
+		changes := tx.Bucket(workChanges)
 		s := internalscanner.Scanner{
 			Recursive: t.config.Recursive, SymlinkPolicy: scannerPolicy(t.config.SymlinkPolicy),
 		}
@@ -103,10 +106,12 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 					return fmt.Errorf("%w: %s", ErrHardlink, state.Path)
 				case ReportHardlinks:
 					after := state
-					t.recordReportEvent(&report, Event{
+					if err := t.stageReportEvent(&report, changes, Event{
 						Kind: EventInvalid, Path: state.Path, After: &after,
 						Source: SourceReconcile, Time: time.Now(),
-					})
+					}); err != nil {
+						return err
+					}
 				}
 			}
 			value, err := encodeFileState(state)
@@ -150,10 +155,25 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 				if err != nil {
 					return err
 				}
-				if path == t.root || t.config.Filter != nil && !t.config.Filter(path, FileState{Path: path}) {
+				if path == t.root {
 					return nil
 				}
+				if t.config.Filter != nil {
+					filterState := FileState{Path: path}
+					if entry.Type != nil {
+						filterState.Type = *entry.Type
+					} else if t.config.ExpectedScope == ExpectedRegularFiles {
+						filterState.Type = FileTypeRegular
+					}
+					if !t.config.Filter(path, filterState) {
+						return nil
+					}
+				}
 				entry.Path = path
+				if entry.Type == nil && t.config.ExpectedScope == ExpectedRegularFiles {
+					regular := FileTypeRegular
+					entry.Type = &regular
+				}
 				value, err := json.Marshal(entry)
 				if err != nil {
 					return err
@@ -171,6 +191,7 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 		previousIDs := tx.Bucket(workPreviousID)
 		actualIDs := tx.Bucket(workActualID)
 		matched := tx.Bucket(workMatched)
+		changes := tx.Bucket(workChanges)
 		cursor := actual.Cursor()
 		for path, value := cursor.First(); path != nil; path, value = cursor.Next() {
 			if err := ctx.Err(); err != nil {
@@ -190,11 +211,17 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 				}
 				switch {
 				case !sameFileIdentity(before, after):
-					t.recordReportEvent(&report, semanticEvent(EventReplaced, after.Path, "", &before, &after))
+					if err := t.stageReportEvent(&report, changes, semanticEvent(EventReplaced, after.Path, "", &before, &after)); err != nil {
+						return err
+					}
 				case fileContentMetadataChanged(before, after):
-					t.recordReportEvent(&report, semanticEvent(EventModified, after.Path, "", &before, &after))
+					if err := t.stageReportEvent(&report, changes, semanticEvent(EventModified, after.Path, "", &before, &after)); err != nil {
+						return err
+					}
 				case before.Mode != after.Mode:
-					t.recordReportEvent(&report, semanticEvent(EventAttributeChanged, after.Path, "", &before, &after))
+					if err := t.stageReportEvent(&report, changes, semanticEvent(EventAttributeChanged, after.Path, "", &before, &after)); err != nil {
+						return err
+					}
 				}
 				continue
 			}
@@ -210,11 +237,15 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 					if err := matched.Put(oldPath, []byte{1}); err != nil {
 						return err
 					}
-					t.recordReportEvent(&report, semanticEvent(EventMoved, after.Path, before.Path, &before, &after))
+					if err := t.stageReportEvent(&report, changes, semanticEvent(EventMoved, after.Path, before.Path, &before, &after)); err != nil {
+						return err
+					}
 					continue
 				}
 			}
-			t.recordReportEvent(&report, semanticEvent(EventCreated, after.Path, "", nil, &after))
+			if err := t.stageReportEvent(&report, changes, semanticEvent(EventCreated, after.Path, "", nil, &after)); err != nil {
+				return err
+			}
 		}
 		cursor = previous.Cursor()
 		for path, value := cursor.First(); path != nil; path, value = cursor.Next() {
@@ -228,7 +259,9 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 			if err := decodeFileState(value, &before); err != nil {
 				return err
 			}
-			t.recordReportEvent(&report, semanticEvent(EventDeleted, before.Path, "", &before, nil))
+			if err := t.stageReportEvent(&report, changes, semanticEvent(EventDeleted, before.Path, "", &before, nil)); err != nil {
+				return err
+			}
 		}
 		if expectedEnabled {
 			expected := tx.Bucket(workExpected)
@@ -240,15 +273,19 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 				}
 				actualValue := actual.Get(path)
 				if actualValue == nil {
-					t.recordReportEvent(&report, semanticEvent(EventMissing, entry.Path, "", nil, nil))
+					if err := t.stageReportEvent(&report, changes, semanticEvent(EventMissing, entry.Path, "", nil, nil)); err != nil {
+						return err
+					}
 					continue
 				}
 				var state FileState
 				if err := decodeFileState(actualValue, &state); err != nil {
 					return err
 				}
-				if entry.Size != nil && state.Size != *entry.Size {
-					t.recordReportEvent(&report, semanticEvent(EventInvalid, state.Path, "", nil, &state))
+				if entry.Type != nil && state.Type != *entry.Type || entry.Size != nil && state.Size != *entry.Size {
+					if err := t.stageReportEvent(&report, changes, semanticEvent(EventInvalid, state.Path, "", nil, &state)); err != nil {
+						return err
+					}
 				} else {
 					report.Healthy++
 				}
@@ -262,7 +299,12 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 				if err := decodeFileState(value, &state); err != nil {
 					return err
 				}
-				t.recordReportEvent(&report, semanticEvent(EventOrphan, state.Path, "", nil, &state))
+				if t.config.ExpectedScope == ExpectedRegularFiles && state.Type != FileTypeRegular {
+					continue
+				}
+				if err := t.stageReportEvent(&report, changes, semanticEvent(EventOrphan, state.Path, "", nil, &state)); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -272,6 +314,22 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 	if !expectedEnabled {
 		report.Healthy = report.Scanned - report.Created - report.Modified - report.Replaced
 	}
+	delivery := newChangeBatcher(ctx, t.config.ChangeSink, report.Generation, t.config.ChangeBatchSize)
+	if err := index.View(func(tx *bolt.Tx) error {
+		cursor := tx.Bucket(workChanges).Cursor()
+		for _, value := cursor.First(); value != nil; _, value = cursor.Next() {
+			var event Event
+			if err := decodeStagedEvent(value, &event); err != nil {
+				return err
+			}
+			if err := delivery.Add(event); err != nil {
+				return err
+			}
+		}
+		return delivery.Finish()
+	}); err != nil {
+		return fail(err)
+	}
 	if err := store.replaceSnapshot(ctx, index, workActual); err != nil {
 		return fail(fmt.Errorf("fsrecon: replace persistent snapshot: %w", err))
 	}
@@ -280,8 +338,9 @@ func (t *Tracker) reconcileBoltLocked(ctx context.Context, store *BoltStore, rep
 	t.stats.filesScanned.Add(report.Scanned)
 	t.stats.missingDetected.Add(report.Missing)
 	t.stats.orphansDetected.Add(report.Orphan)
-	t.stats.eventsDropped.Add(report.EventsTruncated)
-	t.setState(StateSynced)
+	t.stats.reportEventsTruncated.Add(report.EventsTruncated)
+	t.generation.Store(report.Generation)
+	t.setConsistentState()
 	for _, event := range report.Events {
 		t.sendEvent(event)
 	}
@@ -303,9 +362,71 @@ func indexIdentity(bucket *bolt.Bucket, identity, path string) error {
 	return nil
 }
 
-func (t *Tracker) recordReportEvent(report *ReconcileReport, event Event) {
+func (t *Tracker) stageReportEvent(report *ReconcileReport, bucket *bolt.Bucket, event Event) error {
 	countEvent(report, event.Kind)
 	t.addReportEvent(report, event)
+	sequence, err := bucket.NextSequence()
+	if err != nil {
+		return err
+	}
+	var key [8]byte
+	binary.BigEndian.PutUint64(key[:], sequence)
+	value, err := encodeStagedEvent(event)
+	if err != nil {
+		return err
+	}
+	return bucket.Put(key[:], value)
+}
+
+type stagedEvent struct {
+	Kind    EventKind        `json:"kind"`
+	Path    string           `json:"path"`
+	OldPath string           `json:"old_path,omitempty"`
+	Before  *storedFileState `json:"before,omitempty"`
+	After   *storedFileState `json:"after,omitempty"`
+	Source  EventSource      `json:"source"`
+	Time    time.Time        `json:"time"`
+}
+
+func encodeStagedEvent(event Event) ([]byte, error) {
+	return json.Marshal(stagedEvent{
+		Kind: event.Kind, Path: event.Path, OldPath: event.OldPath,
+		Before: storedState(event.Before), After: storedState(event.After),
+		Source: event.Source, Time: event.Time,
+	})
+}
+
+func decodeStagedEvent(value []byte, event *Event) error {
+	var stored stagedEvent
+	if err := json.Unmarshal(value, &stored); err != nil {
+		return err
+	}
+	*event = Event{
+		Kind: stored.Kind, Path: stored.Path, OldPath: stored.OldPath,
+		Before: fileStateFromStored(stored.Before), After: fileStateFromStored(stored.After),
+		Source: stored.Source, Time: stored.Time,
+	}
+	return nil
+}
+
+func storedState(state *FileState) *storedFileState {
+	if state == nil {
+		return nil
+	}
+	return &storedFileState{
+		Path: state.Path, ID: state.ID.value, Type: state.Type, Size: state.Size,
+		ModTime: state.ModTime, Mode: uint32(state.Mode), Schema: 1,
+	}
+}
+
+func fileStateFromStored(stored *storedFileState) *FileState {
+	if stored == nil {
+		return nil
+	}
+	return &FileState{
+		Path: stored.Path, ID: newFileID(stored.ID), Type: stored.Type, Size: stored.Size,
+		ModTime: stored.ModTime, Mode: fs.FileMode(stored.Mode),
+	}
 }
 
 func semanticEvent(kind EventKind, path, oldPath string, before, after *FileState) Event {

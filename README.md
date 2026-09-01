@@ -30,7 +30,7 @@ Expected state (optional) ─────┘
 - Linux, macOS, and Windows filesystem identities behind an opaque `FileID`.
 - Native filesystem notifications through `fsnotify` (`inotify`, `kqueue`, and
   `ReadDirectoryChangesW`).
-- Recursive, callback-based filesystem scanning.
+- Recursive, callback-based filesystem scanning with batched directory reads.
 - Semantic `Created`, `Modified`, `Deleted`, `Moved`, and `Replaced` events.
 - Optional expected-state reconciliation for `Missing`, `Orphan`, and
   metadata-invalid paths.
@@ -40,7 +40,8 @@ Expected state (optional) ─────┘
 - Configurable filtering, symlink policy, and hardlink policy.
 - Debounced DirtySet reconciliation that collapses overlapping subtrees.
 - Explicit SHA-256 integrity scrubbing outside watcher goroutines.
-- Bounded event delivery with observable drop statistics.
+- Bounded best-effort event delivery plus optional authoritative `ChangeSink`
+  batches committed before snapshot advancement.
 - Context cancellation, clean shutdown, and periodic reconciliation.
 - No database, network, logging, or metrics-framework dependency in the core.
 
@@ -225,6 +226,18 @@ With an expected provider:
 - Expected but absent paths produce `Missing`.
 - Actual paths absent from the manifest produce `Orphan`.
 - A size mismatch produces `Invalid`.
+- A configured type mismatch produces `Invalid`.
+
+Expected state defaults to a regular-file manifest: unlisted parent directories
+are not classified as orphans, and an entry without `Type` expects a regular
+file. Set `ExpectedEntry.Type` to explicitly expect a directory, symlink, or
+other entry. Set `ExpectedScope: ExpectedAllEntries` when every unlisted
+filesystem entry, including directories, should be classified as an orphan.
+
+Providers with large manifests can additionally implement
+`ScopedExpectedProvider`; dirty-subtree reconciliation uses it without walking
+unrelated expected entries. Existing `ExpectedProvider` implementations remain
+valid as a full-walk fallback.
 
 `Fingerprint` is evaluated by `Tracker.Scrub` when an integrity checker is
 configured. Metadata reconciliation never hashes file contents.
@@ -258,6 +271,8 @@ types are never exposed.
 | `Root` | required | File or directory to reconcile. It is normalized to an absolute path. |
 | `Recursive` | `false` | Traverse descendants instead of only immediate children. |
 | `Expected` | `nil` | Optional expected-state provider. |
+| `ExpectedScope` | `ExpectedRegularFiles` | Restrict orphan detection to regular files, or include every entry. |
+| `ChangeSink` | `nil` | Optional authoritative, at-least-once reconciliation delivery. |
 | `Integrity` | `nil` | Optional checker used only by explicit `Scrub` calls. |
 | `Store` | `MemoryStore` | Snapshot store used across reconciliations. |
 | `Filter` | `nil` | Return `true` for paths that should be tracked. Filtering a directory prunes its subtree. |
@@ -267,6 +282,7 @@ types are never exposed.
 | `ReconcileInterval` | disabled | Optional safety interval between full reconciliations. Native root events remain active when disabled. |
 | `EventBuffer` | `256` | Capacity of the public semantic-event channel. |
 | `ReportEventLimit` | `10000` | Maximum detailed events retained by one report; counters remain complete. |
+| `ChangeBatchSize` | `256` | Maximum events passed to one `ChangeSink` call. |
 
 The safe default is to ignore symlinks. Enable `FollowSymlinks` only when
 traversal outside the lexical root is acceptable for your application.
@@ -295,6 +311,10 @@ type SnapshotStore interface {
 	Walk(context.Context, string, func(fsrecon.FileState) error) error
 }
 ```
+
+Stores may implement `ScopedSnapshotStore` for an optimized subtree walk.
+`MemoryStore` uses an in-memory path trie, while `BoltStore` seeks ordered keys
+with a B+Tree cursor. The base `SnapshotStore.Walk` method remains the fallback.
 
 `FileID` supports text marshaling so an opaque identity can be persisted without
 exposing inode, device, volume, or Windows file-index fields through the API.
@@ -331,7 +351,9 @@ report, err := tracker.Scrub(ctx)
 ```
 
 Expected SHA-256 values belong in `ExpectedEntry.Fingerprint`. A mismatch emits
-`CORRUPT` with `SourceIntegrity`.
+`CORRUPT` with `SourceIntegrity`. Integrity event detail is bounded by
+`ReportEventLimit`; `IntegrityReport.EventsTruncated` exposes omitted detail
+while `Corrupt` remains exact.
 
 ## Consistency model
 
@@ -361,6 +383,8 @@ CREATED -> STARTING -> SYNCING -> RECONCILING -> SYNCED
                                       v             v
                                     DIRTY      RECONCILING
 
+native backend stops -> DEGRADED -> reconciliation -> DEGRADED
+
 Any active state -> STOPPED
 ```
 
@@ -370,24 +394,34 @@ policy is documented in [Versioning](docs/versioning.md).
 
 ## Backpressure and statistics
 
-The event channel and per-report detail are bounded. A slow consumer does not
-block reconciliation; instead, excess events are dropped and recorded in
-`Stats`. `ReconcileReport.EventsTruncated` reports detail omitted after
-`ReportEventLimit`, while aggregate counters remain complete:
+`Events()` is a bounded best-effort convenience stream. A slow consumer does
+not block reconciliation; excess channel events increment
+`PublicEventsDropped` (and the compatibility alias `EventsDropped`). Report
+truncation is separate: `ReconcileReport.EventsTruncated` and
+`Stats.ReportEventsTruncated` count detail omitted after `ReportEventLimit`,
+while aggregate counters remain complete.
+
+Applications requiring authoritative background delivery should configure a
+`ChangeSink`. Batches are identified by `(Generation, Sequence)` and `Final`
+marks the last batch. All batches must succeed before fsrecon advances its
+snapshot. Sink failures leave the tracker dirty and the next reconciliation
+retries the same semantic diff. Delivery is at-least-once, so sinks must handle
+repeated generation and sequence values.
 
 ```go
 stats := tracker.Stats()
 fmt.Printf(
-	"scanned=%d reconciliations=%d dropped=%d queue=%d\n",
+	"scanned=%d reconciliations=%d public_dropped=%d report_truncated=%d queue=%d\n",
 	stats.FilesScanned,
 	stats.Reconciliations,
-	stats.EventsDropped,
+	stats.PublicEventsDropped,
+	stats.ReportEventsTruncated,
 	stats.QueueDepth,
 )
 ```
 
-If `EventsDropped` increases, perform or schedule reconciliation and read the
-returned `ReconcileReport` for that pass. The event stream is not a durable log.
+The event stream and retained report detail are not durable logs. `ChangeSink`
+is the reliable background-consumption contract.
 
 ## CLI
 
@@ -427,9 +461,11 @@ Scanned: 2  Healthy: 0  Missing: 0  Orphan: 0  Duration: 240.1µs
 
 Current scalability characteristics:
 
-- The scanner streams entries and does not create a scanner-owned `[]FileState`.
+- The scanner reads each directory in batches of 1024 and does not create a
+  scanner-owned `[]FileState` or a cycle map unless symlinks are followed.
 - Partial reconciliation uses O(K) working memory. `MemoryStore` full passes use
-  O(N) indexes; `BoltStore` full passes spill comparison indexes to temporary
+  O(N) comparison maps but scoped walks use an O(depth + K) path trie;
+  `BoltStore` full passes spill comparison indexes to temporary
   disk and keep report detail bounded by `ReportEventLimit`.
 - Queues exposed by the tracker are bounded.
 - Content hashing is not performed during metadata reconciliation.

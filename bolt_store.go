@@ -105,6 +105,11 @@ func (s *BoltStore) Apply(ctx context.Context, puts []FileState, deletes []strin
 }
 
 func (s *BoltStore) Walk(ctx context.Context, prefix string, fn func(FileState) error) error {
+	return s.WalkScope(ctx, prefix, fn)
+}
+
+// WalkScope uses a B+Tree cursor seek and stops at the end of the subtree.
+func (s *BoltStore) WalkScope(ctx context.Context, prefix string, fn func(FileState) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

@@ -4,6 +4,7 @@ package scanner
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 )
 
 var ErrSymlink = errors.New("symlink rejected by policy")
+
+const directoryBatchSize = 1024
 
 type SymlinkPolicy uint8
 
@@ -45,13 +48,31 @@ func (s Scanner) Scan(ctx context.Context, root string, fn func(Entry) error) er
 	if err != nil {
 		return err
 	}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		switch s.SymlinkPolicy {
+		case IgnoreSymlinks:
+			return nil
+		case RejectSymlinks:
+			return &fs.PathError{Op: "scan", Path: root, Err: ErrSymlink}
+		case ReportSymlinks:
+			return s.emit(ctx, root, info, fn)
+		case FollowSymlinks:
+			info, err = os.Stat(root)
+			if err != nil {
+				return err
+			}
+		}
+	}
 	if !info.IsDir() {
 		return s.emit(ctx, root, info, fn)
 	}
 
-	seen := make(map[string]struct{})
-	if id, _, err := fileIdentity(root, info); err == nil && id != "" {
-		seen[id] = struct{}{}
+	var seen map[string]struct{}
+	if s.SymlinkPolicy == FollowSymlinks {
+		seen = make(map[string]struct{})
+		if id, _, err := fileIdentity(root, info, true); err == nil && id != "" {
+			seen[id] = struct{}{}
+		}
 	}
 	return s.walkDir(ctx, root, fn, seen)
 }
@@ -60,76 +81,85 @@ func (s Scanner) walkDir(ctx context.Context, dir string, fn func(Entry) error, 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(dir)
+	directory, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	for _, dirEntry := range entries {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		path := filepath.Join(dir, dirEntry.Name())
-		info, err := os.Lstat(path)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				continue // The filesystem changed during traversal.
+	defer directory.Close()
+	for {
+		entries, readErr := directory.ReadDir(directoryBatchSize)
+		for _, dirEntry := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			return err
-		}
+			path := filepath.Join(dir, dirEntry.Name())
+			info, err := os.Lstat(path)
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					continue // The filesystem changed during traversal.
+				}
+				return err
+			}
 
-		isLink := info.Mode()&fs.ModeSymlink != 0
-		if isLink {
-			switch s.SymlinkPolicy {
-			case IgnoreSymlinks:
-				continue
-			case RejectSymlinks:
-				return &fs.PathError{Op: "scan", Path: path, Err: ErrSymlink}
-			case FollowSymlinks:
-				info, err = os.Stat(path)
-				if err != nil {
-					if errors.Is(err, fs.ErrNotExist) {
-						continue
+			isLink := info.Mode()&fs.ModeSymlink != 0
+			followedLink := false
+			if isLink {
+				switch s.SymlinkPolicy {
+				case IgnoreSymlinks:
+					continue
+				case RejectSymlinks:
+					return &fs.PathError{Op: "scan", Path: path, Err: ErrSymlink}
+				case FollowSymlinks:
+					info, err = os.Stat(path)
+					if err != nil {
+						if errors.Is(err, fs.ErrNotExist) {
+							continue
+						}
+						return err
 					}
-					return err
+					followedLink = true
 				}
 			}
-		}
 
-		entry, err := makeEntry(path, info)
-		if err != nil {
-			return err
-		}
-		if s.Filter != nil && !s.Filter(entry) {
-			continue
-		}
-		if err := fn(entry); err != nil {
-			return err
-		}
-		if !s.Recursive || !info.IsDir() {
-			continue
-		}
-		id, _, err := fileIdentity(path, info)
-		if err != nil {
-			return err
-		}
-		if id != "" {
-			if _, ok := seen[id]; ok {
+			entry, err := makeEntry(path, info, followedLink)
+			if err != nil {
+				return err
+			}
+			if s.Filter != nil && !s.Filter(entry) {
 				continue
 			}
-			seen[id] = struct{}{}
+			if err := fn(entry); err != nil {
+				return err
+			}
+			if !s.Recursive || !info.IsDir() {
+				continue
+			}
+			if seen != nil {
+				if entry.Identity != "" {
+					if _, ok := seen[entry.Identity]; ok {
+						continue
+					}
+					seen[entry.Identity] = struct{}{}
+				}
+			}
+			if err := s.walkDir(ctx, path, fn, seen); err != nil {
+				return err
+			}
 		}
-		if err := s.walkDir(ctx, path, fn, seen); err != nil {
-			return err
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
 		}
 	}
-	return nil
 }
 
 func (s Scanner) emit(ctx context.Context, path string, info fs.FileInfo, fn func(Entry) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	entry, err := makeEntry(path, info)
+	entry, err := makeEntry(path, info, false)
 	if err != nil {
 		return err
 	}
@@ -139,8 +169,8 @@ func (s Scanner) emit(ctx context.Context, path string, info fs.FileInfo, fn fun
 	return fn(entry)
 }
 
-func makeEntry(path string, info fs.FileInfo) (Entry, error) {
-	id, links, err := fileIdentity(path, info)
+func makeEntry(path string, info fs.FileInfo, followSymlink bool) (Entry, error) {
+	id, links, err := fileIdentity(path, info, followSymlink)
 	if err != nil {
 		return Entry{}, err
 	}

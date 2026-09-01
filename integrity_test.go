@@ -97,3 +97,35 @@ func TestIntegrityScrubRequiresChecker(t *testing.T) {
 		t.Fatalf("Scrub() error = %v", err)
 	}
 }
+
+type alwaysCorruptChecker struct{}
+
+func (alwaysCorruptChecker) Check(context.Context, FileState) (IntegrityResult, error) {
+	return IntegrityResult{Valid: false}, nil
+}
+
+func TestIntegrityReportIsBounded(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 5; i++ {
+		if err := os.WriteFile(filepath.Join(root, string(rune('a'+i))), []byte("bad"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tracker, err := New(Config{
+		Root: root, Recursive: true, Integrity: alwaysCorruptChecker{}, ReportEventLimit: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	report, err := tracker.Scrub(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Corrupt != 5 || len(report.Events) != 2 || report.EventsTruncated != 3 {
+		t.Fatalf("report = %+v", report)
+	}
+	if tracker.Stats().ReportEventsTruncated != 3 {
+		t.Fatalf("stats = %+v", tracker.Stats())
+	}
+}

@@ -5,6 +5,7 @@ package scanner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -37,6 +38,27 @@ func TestScannerRecursiveAndSymlinkPolicies(t *testing.T) {
 	err = (Scanner{Recursive: true, SymlinkPolicy: RejectSymlinks}).Scan(context.Background(), root, func(Entry) error { return nil })
 	if !errors.Is(err, ErrSymlink) {
 		t.Fatalf("reject error = %v", err)
+	}
+}
+
+func TestScannerReadsLargeFlatDirectoryInBatches(t *testing.T) {
+	root := t.TempDir()
+	want := directoryBatchSize*2 + 17
+	for i := 0; i < want; i++ {
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("%05d", i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count := 0
+	err := (Scanner{Recursive: true}).Scan(context.Background(), root, func(Entry) error {
+		count++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != want {
+		t.Fatalf("scanned %d entries, want %d", count, want)
 	}
 }
 

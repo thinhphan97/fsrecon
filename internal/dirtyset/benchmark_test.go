@@ -16,6 +16,9 @@ func BenchmarkCollapse100K(b *testing.B) {
 		if set.Len() == 0 {
 			b.Fatal("empty dirty set")
 		}
+		if scopes := set.Drain(); len(scopes) == 0 {
+			b.Fatal("no dirty scopes")
+		}
 	}
 	b.ReportMetric(100_000*float64(b.N)/b.Elapsed().Seconds(), "paths/s")
 }

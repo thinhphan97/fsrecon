@@ -6,7 +6,7 @@ import "sort"
 type State struct {
 	Path    string
 	ID      string
-	Type    uint8
+	Type    FileType
 	Size    int64
 	ModUnix int64
 	Mode    uint32
@@ -14,9 +14,20 @@ type State struct {
 
 type Expected struct {
 	Path        string
+	Type        *FileType
 	Size        *int64
 	Fingerprint []byte
 }
+
+type FileType uint8
+
+const (
+	TypeUnknown FileType = iota
+	TypeRegular
+	TypeDirectory
+	TypeSymlink
+	TypeOther
+)
 
 type Kind uint8
 
@@ -45,6 +56,22 @@ type Change struct {
 // expected and therefore every actual entry is an orphan.
 func Diff(previous, actual map[string]State, expected map[string]Expected) []Change {
 	changes := make([]Change, 0)
+	WalkDiff(previous, actual, expected, func(change Change) error {
+		changes = append(changes, change)
+		return nil
+	})
+	return changes
+}
+
+// WalkDiff streams changes in stable path order without retaining the complete
+// result. The input maps are not modified.
+func WalkDiff(previous, actual map[string]State, expected map[string]Expected, emit func(Change) error) error {
+	return WalkDiffScoped(previous, actual, expected, nil, emit)
+}
+
+// WalkDiffScoped is WalkDiff with an optional predicate limiting which
+// unlisted actual entries participate in expected-state orphan detection.
+func WalkDiffScoped(previous, actual map[string]State, expected map[string]Expected, orphanEligible func(State) bool, emit func(Change) error) error {
 	remainingPrevious := clone(previous)
 	remainingActual := clone(actual)
 
@@ -58,11 +85,17 @@ func Diff(previous, actual map[string]State, expected map[string]Expected) []Cha
 		delete(remainingActual, path)
 		switch {
 		case !sameIdentity(before, after):
-			changes = append(changes, change(Replaced, path, "", &before, &after))
+			if err := emit(change(Replaced, path, "", &before, &after)); err != nil {
+				return err
+			}
 		case contentChanged(before, after):
-			changes = append(changes, change(Modified, path, "", &before, &after))
+			if err := emit(change(Modified, path, "", &before, &after)); err != nil {
+				return err
+			}
 		case before.Mode != after.Mode:
-			changes = append(changes, change(AttributeChanged, path, "", &before, &after))
+			if err := emit(change(AttributeChanged, path, "", &before, &after)); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -77,17 +110,23 @@ func Diff(previous, actual map[string]State, expected map[string]Expected) []Cha
 		}
 		before := remainingPrevious[oldPath]
 		after := remainingActual[newPath]
-		changes = append(changes, change(Moved, newPath, oldPath, &before, &after))
+		if err := emit(change(Moved, newPath, oldPath, &before, &after)); err != nil {
+			return err
+		}
 		delete(remainingPrevious, oldPath)
 		delete(remainingActual, newPath)
 	}
 	for _, path := range sortedKeys(remainingActual) {
 		after := remainingActual[path]
-		changes = append(changes, change(Created, path, "", nil, &after))
+		if err := emit(change(Created, path, "", nil, &after)); err != nil {
+			return err
+		}
 	}
 	for _, path := range sortedKeys(remainingPrevious) {
 		before := remainingPrevious[path]
-		changes = append(changes, change(Deleted, path, "", &before, nil))
+		if err := emit(change(Deleted, path, "", &before, nil)); err != nil {
+			return err
+		}
 	}
 
 	if expected != nil {
@@ -95,21 +134,30 @@ func Diff(previous, actual map[string]State, expected map[string]Expected) []Cha
 			exp := expected[path]
 			state, ok := actual[path]
 			if !ok {
-				changes = append(changes, Change{Kind: Missing, Path: path})
+				if err := emit(Change{Kind: Missing, Path: path}); err != nil {
+					return err
+				}
 				continue
 			}
-			if exp.Size != nil && state.Size != *exp.Size {
-				changes = append(changes, change(Invalid, path, "", nil, &state))
+			if exp.Type != nil && state.Type != *exp.Type || exp.Size != nil && state.Size != *exp.Size {
+				if err := emit(change(Invalid, path, "", nil, &state)); err != nil {
+					return err
+				}
 			}
 		}
 		for _, path := range sortedKeys(actual) {
+			if orphanEligible != nil && !orphanEligible(actual[path]) {
+				continue
+			}
 			if _, ok := expected[path]; !ok {
 				state := actual[path]
-				changes = append(changes, change(Orphan, path, "", nil, &state))
+				if err := emit(change(Orphan, path, "", nil, &state)); err != nil {
+					return err
+				}
 			}
 		}
 	}
-	return changes
+	return nil
 }
 
 func change(kind Kind, path, oldPath string, before, after *State) Change {

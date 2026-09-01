@@ -14,7 +14,13 @@ go test -run='^$' -bench=BenchmarkMemoryStoreScale -benchmem .
 go test -run='^$' -bench=BenchmarkBoltStorePointLookup -benchmem .
 go test -run='^$' -bench='BenchmarkBoltStore(Walk|Batch)' -benchmem .
 go test -run='^$' -bench=BenchmarkFullReconcile10K -benchmem .
+go test -run='^$' -bench=BenchmarkDirtySubtreeReconciliation -benchmem .
+go test -run='^$' -bench=BenchmarkStartupToSynced -benchmem .
+go test -run='^$' -bench=BenchmarkPersistentRestartVerification10K -benchmem .
 go test -run='^$' -bench=BenchmarkCollapse100K -benchmem ./internal/dirtyset
+go test -run='^$' -bench=BenchmarkEventProcessing -benchmem ./internal/normalize
+go test -run='^$' -bench='Benchmark(LargeFlatDirectory|DeepDirectoryTree)' -benchmem ./internal/scanner
+go test -run='^$' -bench=BenchmarkWatchRegistration10K -benchmem ./internal/watchtree
 ```
 
 The 10-million-entry memory case is opt-in because it can consume significant
@@ -24,9 +30,30 @@ RAM:
 FSRECON_BENCH_10M=1 go test -run='^$' -bench=BenchmarkMemoryStoreScale/10M -benchtime=1x .
 ```
 
+The 1-million-file startup case is also opt-in:
+
+```bash
+FSRECON_BENCH_1M=1 go test -run='^$' -bench=BenchmarkStartupToSynced/1M -benchtime=1x .
+```
+
+On macOS, kqueue can consume one descriptor per existing file during recursive
+watch registration. The 100K/1M native-startup cases therefore skip by default
+to avoid exhausting the process limit; run them only after raising `ulimit -n`:
+
+```bash
+FSRECON_BENCH_NATIVE_LARGE=1 FSRECON_BENCH_1M=1 \
+  go test -run='^$' -bench=BenchmarkStartupToSynced -benchtime=1x .
+```
+
 Benchmark results depend heavily on filesystem, storage, operating system, and
 Go version. Record those details with every published baseline. CI validates
 that benchmarks compile but does not run the large-scale cases on every push.
+
+The suite covers raw hint normalization throughput, 100K-hint DirtySet
+collapse, full versus 1% and 0.01% reconciliation scopes, flat and deep scanner
+layouts, startup-to-synced time, persistent restart verification, and recursive
+watch registration overhead. The baseline below predates these additional
+cases; no numbers are claimed until measured on the documented host.
 
 ## Baseline
 

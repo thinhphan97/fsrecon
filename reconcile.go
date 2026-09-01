@@ -34,15 +34,17 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 	}
 	t.setState(StateReconciling)
 	report := ReconcileReport{StartedAt: time.Now()}
+	report.Generation = t.generation.Load() + 1
 	fail := func(err error) (ReconcileReport, error) {
 		report.Duration = time.Since(report.StartedAt)
-		t.setState(StateDirty)
+		t.markDirty()
 		return report, err
 	}
 	scopes := collapseScopes(t.root, requested)
 	if len(scopes) == 0 {
 		report.Duration = time.Since(report.StartedAt)
-		t.setState(StateSynced)
+		t.generation.Store(report.Generation)
+		t.setConsistentState()
 		return report, nil
 	}
 	if store, ok := t.store.(*BoltStore); ok && len(scopes) == 1 && scopes[0] == t.root {
@@ -51,7 +53,7 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 
 	previous := make(map[string]FileState)
 	for _, scope := range scopes {
-		if err := t.store.Walk(ctx, scope, func(state FileState) error {
+		if err := walkSnapshotScope(ctx, t.store, scope, func(state FileState) error {
 			previous[state.Path] = state
 			return nil
 		}); err != nil {
@@ -135,16 +137,31 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 	if err != nil {
 		return fail(err)
 	}
-	changes := internalreconcile.Diff(toInternalStates(previous), toInternalStates(actual), expected)
-	report.Events = make([]Event, 0, len(changes)+len(policyEvents))
-	for _, change := range changes {
-		event := eventFromChange(change)
+	report.Events = make([]Event, 0, min(t.config.ReportEventLimit, len(actual)+len(previous)))
+	delivery := newChangeBatcher(ctx, t.config.ChangeSink, report.Generation, t.config.ChangeBatchSize)
+	err = internalreconcile.WalkDiffScoped(toInternalStates(previous), toInternalStates(actual), expected, func(state internalreconcile.State) bool {
+		return t.config.ExpectedScope == ExpectedAllEntries || fileTypeFromInternal(state.Type) == FileTypeRegular
+	}, func(change internalreconcile.Change) error {
+		event, err := eventFromChange(change)
+		if err != nil {
+			return err
+		}
 		countEvent(&report, event.Kind)
 		t.addReportEvent(&report, event)
+		return delivery.Add(event)
+	})
+	if err != nil {
+		return fail(err)
 	}
 	for _, event := range policyEvents {
 		countEvent(&report, event.Kind)
 		t.addReportEvent(&report, event)
+		if err := delivery.Add(event); err != nil {
+			return fail(err)
+		}
+	}
+	if err := delivery.Finish(); err != nil {
+		return fail(err)
 	}
 
 	deletes := make([]string, 0)
@@ -177,7 +194,7 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 	if expected != nil {
 		for path, entry := range expected {
 			state, ok := actual[path]
-			if ok && (entry.Size == nil || state.Size == *entry.Size) {
+			if ok && (entry.Type == nil || internalTypeFromPublic(state.Type) == *entry.Type) && (entry.Size == nil || state.Size == *entry.Size) {
 				report.Healthy++
 			}
 		}
@@ -189,12 +206,20 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 	t.stats.filesScanned.Add(report.Scanned)
 	t.stats.missingDetected.Add(report.Missing)
 	t.stats.orphansDetected.Add(report.Orphan)
-	t.stats.eventsDropped.Add(report.EventsTruncated)
-	t.setState(StateSynced)
+	t.stats.reportEventsTruncated.Add(report.EventsTruncated)
+	t.generation.Store(report.Generation)
+	t.setConsistentState()
 	for _, event := range report.Events {
 		t.sendEvent(event)
 	}
 	return report, nil
+}
+
+func walkSnapshotScope(ctx context.Context, store SnapshotStore, scope string, fn func(FileState) error) error {
+	if scoped, ok := store.(ScopedSnapshotStore); ok {
+		return scoped.WalkScope(ctx, scope, fn)
+	}
+	return store.Walk(ctx, scope, fn)
 }
 
 func (t *Tracker) addReportEvent(report *ReconcileReport, event Event) {
@@ -242,29 +267,59 @@ func (t *Tracker) loadExpectedScopes(ctx context.Context, scopes []string) (map[
 		return nil, nil
 	}
 	expected := make(map[string]internalreconcile.Expected)
-	err := t.config.Expected.WalkExpected(ctx, t.root, func(entry ExpectedEntry) error {
+	consume := func(entry ExpectedEntry) error {
 		path, err := t.expectedPath(entry.Path)
 		if err != nil {
 			return err
 		}
-		if t.config.Filter != nil && !t.config.Filter(path, FileState{Path: path}) {
-			return nil
+		if t.config.Filter != nil {
+			filterState := FileState{Path: path}
+			if entry.Type != nil {
+				filterState.Type = *entry.Type
+			} else if t.config.ExpectedScope == ExpectedRegularFiles {
+				filterState.Type = FileTypeRegular
+			}
+			if !t.config.Filter(path, filterState) {
+				return nil
+			}
 		}
 		inScope := false
-		for _, scope := range scopes {
-			if pathHasPrefix(path, scope) && path != scope {
-				inScope = true
-				break
+		if path != t.root {
+			for _, scope := range scopes {
+				if pathHasPrefix(path, scope) {
+					inScope = true
+					break
+				}
 			}
 		}
 		if !inScope {
 			return nil
 		}
+		expectedType := entry.Type
+		if expectedType == nil && t.config.ExpectedScope == ExpectedRegularFiles {
+			regular := FileTypeRegular
+			expectedType = &regular
+		}
+		var internalType *internalreconcile.FileType
+		if expectedType != nil {
+			value := internalTypeFromPublic(*expectedType)
+			internalType = &value
+		}
 		expected[path] = internalreconcile.Expected{
-			Path: path, Size: entry.Size, Fingerprint: append([]byte(nil), entry.Fingerprint...),
+			Path: path, Type: internalType, Size: entry.Size, Fingerprint: append([]byte(nil), entry.Fingerprint...),
 		}
 		return nil
-	})
+	}
+	var err error
+	if scoped, ok := t.config.Expected.(ScopedExpectedProvider); ok {
+		for _, scope := range scopes {
+			if err = scoped.WalkExpectedScope(ctx, t.root, scope, consume); err != nil {
+				break
+			}
+		}
+	} else {
+		err = t.config.Expected.WalkExpected(ctx, t.root, consume)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("fsrecon: walk expected state: %w", err)
 	}
@@ -290,14 +345,14 @@ func toInternalStates(states map[string]FileState) map[string]internalreconcile.
 	result := make(map[string]internalreconcile.State, len(states))
 	for path, state := range states {
 		result[path] = internalreconcile.State{
-			Path: path, ID: state.ID.value, Type: uint8(state.Type), Size: state.Size,
+			Path: path, ID: state.ID.value, Type: internalTypeFromPublic(state.Type), Size: state.Size,
 			ModUnix: state.ModTime.UnixNano(), Mode: uint32(state.Mode),
 		}
 	}
 	return result
 }
 
-func eventFromChange(change internalreconcile.Change) Event {
+func eventFromChange(change internalreconcile.Change) (Event, error) {
 	var before, after *FileState
 	if change.Before != nil {
 		state := fromInternalState(*change.Before)
@@ -307,16 +362,75 @@ func eventFromChange(change internalreconcile.Change) Event {
 		state := fromInternalState(*change.After)
 		after = &state
 	}
-	return Event{
-		Kind: EventKind(change.Kind), Path: change.Path, OldPath: change.OldPath,
-		Before: before, After: after, Source: SourceReconcile, Time: time.Now(),
+	kind, err := eventKindFromInternal(change.Kind)
+	if err != nil {
+		return Event{}, err
 	}
+	return Event{
+		Kind: kind, Path: change.Path, OldPath: change.OldPath,
+		Before: before, After: after, Source: SourceReconcile, Time: time.Now(),
+	}, nil
 }
 
 func fromInternalState(state internalreconcile.State) FileState {
 	return FileState{
-		Path: state.Path, ID: newFileID(state.ID), Type: FileType(state.Type), Size: state.Size,
+		Path: state.Path, ID: newFileID(state.ID), Type: fileTypeFromInternal(state.Type), Size: state.Size,
 		ModTime: time.Unix(0, state.ModUnix), Mode: fs.FileMode(state.Mode),
+	}
+}
+
+func eventKindFromInternal(kind internalreconcile.Kind) (EventKind, error) {
+	switch kind {
+	case internalreconcile.Created:
+		return EventCreated, nil
+	case internalreconcile.Modified:
+		return EventModified, nil
+	case internalreconcile.Deleted:
+		return EventDeleted, nil
+	case internalreconcile.Moved:
+		return EventMoved, nil
+	case internalreconcile.AttributeChanged:
+		return EventAttributeChanged, nil
+	case internalreconcile.Missing:
+		return EventMissing, nil
+	case internalreconcile.Orphan:
+		return EventOrphan, nil
+	case internalreconcile.Replaced:
+		return EventReplaced, nil
+	case internalreconcile.Invalid:
+		return EventInvalid, nil
+	default:
+		return 0, fmt.Errorf("fsrecon: unknown internal event kind %d", kind)
+	}
+}
+
+func internalTypeFromPublic(fileType FileType) internalreconcile.FileType {
+	switch fileType {
+	case FileTypeRegular:
+		return internalreconcile.TypeRegular
+	case FileTypeDirectory:
+		return internalreconcile.TypeDirectory
+	case FileTypeSymlink:
+		return internalreconcile.TypeSymlink
+	case FileTypeOther:
+		return internalreconcile.TypeOther
+	default:
+		return internalreconcile.TypeUnknown
+	}
+}
+
+func fileTypeFromInternal(fileType internalreconcile.FileType) FileType {
+	switch fileType {
+	case internalreconcile.TypeRegular:
+		return FileTypeRegular
+	case internalreconcile.TypeDirectory:
+		return FileTypeDirectory
+	case internalreconcile.TypeSymlink:
+		return FileTypeSymlink
+	case internalreconcile.TypeOther:
+		return FileTypeOther
+	default:
+		return FileTypeUnknown
 	}
 }
 

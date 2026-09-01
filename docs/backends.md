@@ -10,11 +10,21 @@ Raw backend events will never be exposed publicly. Tests assert eventual
 semantic state instead of platform-specific event sequences.
 
 The tracker registers the configured root before its initial scan. Events that
-occur during that scan remain buffered and trigger another reconciliation,
-closing the scan-then-watch startup race.
+occur during that scan are drained concurrently by the collector and trigger
+another reconciliation, closing the scan-then-watch startup race without
+blocking the backend reader during long scans.
 
 With `Recursive` enabled, the watch tree registers each directory before its
 children are scanned. New directories are watched before their contents are
 traversed, and watches below deleted subtrees are removed after reconciliation.
 The optional `ReconcileInterval` remains a safety net for kernel queue loss and
 changes made while the process was stopped.
+
+An unexpectedly closed backend event stream moves the tracker to `DEGRADED`.
+A successful scan does not change that state back to `SYNCED`, because current
+truth and continuous observation health are distinct. Automatic backend restart
+is not implemented; recreate the tracker to restore native observation.
+
+On Windows, `FollowSymlinks` opens the followed target when retrieving opaque
+file identity. Non-following modes identify the reparse point. This keeps target
+identity and cycle detection consistent with `os.Stat` traversal semantics.

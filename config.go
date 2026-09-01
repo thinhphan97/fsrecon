@@ -29,6 +29,8 @@ type Config struct {
 	Root              string
 	Recursive         bool
 	Expected          ExpectedProvider
+	ExpectedScope     ExpectedEntryScope
+	ChangeSink        ChangeSink
 	Integrity         IntegrityChecker
 	Store             SnapshotStore
 	Filter            FilterFunc
@@ -38,8 +40,10 @@ type Config struct {
 	ReconcileInterval time.Duration
 	EventBuffer       int
 	ReportEventLimit  int
+	ChangeBatchSize   int
 }
 
 const defaultEventBuffer = 256
 const defaultDebounceWindow = 100 * time.Millisecond
 const defaultReportEventLimit = 10_000
+const defaultChangeBatchSize = 256

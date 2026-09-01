@@ -100,7 +100,11 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 			Source: SourceIntegrity, Time: time.Now(),
 		}
 		report.Corrupt++
-		report.Events = append(report.Events, event)
+		if len(report.Events) < t.config.ReportEventLimit {
+			report.Events = append(report.Events, event)
+		} else {
+			report.EventsTruncated++
+		}
 		return nil
 	})
 	report.Duration = time.Since(report.StartedAt)
@@ -109,6 +113,7 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 	}
 	t.stats.integrityScanned.Add(report.Scanned)
 	t.stats.corruptDetected.Add(report.Corrupt)
+	t.stats.reportEventsTruncated.Add(report.EventsTruncated)
 	for _, event := range report.Events {
 		t.sendEvent(event)
 	}
