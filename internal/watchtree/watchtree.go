@@ -76,6 +76,15 @@ func (t *Tree) Count() int {
 	return len(t.watched)
 }
 
+// IsWatched reports whether path has an active registration.
+func (t *Tree) IsWatched(path string) bool {
+	path = filepath.Clean(path)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, ok := t.watched[path]
+	return ok
+}
+
 // RemoveSubtree removes a path and all descendant registrations.
 func (t *Tree) RemoveSubtree(path string) error {
 	path = filepath.Clean(path)

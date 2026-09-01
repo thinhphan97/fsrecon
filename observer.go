@@ -153,21 +153,38 @@ func (o *Observer) handleRaw(ctx context.Context, tree *watchtree.Tree, raw inte
 	if !withinObserver(o.root, path) {
 		return
 	}
-	if raw.Op&internalbackend.OpRemove != 0 || raw.Op&internalbackend.OpRename != 0 {
+	wasWatched := tree != nil && tree.IsWatched(path)
+	if raw.Op&internalbackend.OpRemove != 0 {
 		if tree != nil {
 			if err := tree.RemoveSubtree(path); err != nil {
 				o.degrade(err)
 				return
 			}
 		}
-		if raw.Op&internalbackend.OpRename != 0 {
+		if wasWatched {
+			o.enqueue(Hint{Path: path, Scope: HintSubtree, Cause: HintNativeChange, Time: time.Now()})
+			return
+		}
+		if o.config.Filter == nil || o.config.Filter(path) {
+			o.enqueue(Hint{Path: path, Scope: HintPath, Cause: HintNativeChange, Time: time.Now()})
+		}
+		return
+	}
+	if raw.Op&internalbackend.OpRename != 0 {
+		if tree != nil {
+			if err := tree.RemoveSubtree(path); err != nil {
+				o.degrade(err)
+				return
+			}
+		}
+		if o.config.Recursive {
 			if err := o.resyncWatchTree(ctx); err != nil {
 				o.degrade(err)
 				return
 			}
-			o.enqueue(Hint{Path: filepath.Dir(path), Scope: HintSubtree, Cause: HintNativeChange, Time: time.Now()})
-			return
 		}
+		o.enqueue(Hint{Path: o.root, Scope: HintSubtree, Cause: HintNativeChange, Time: time.Now()})
+		return
 	}
 	if o.config.Recursive && raw.Op&internalbackend.OpCreate != 0 {
 		if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
@@ -381,7 +398,7 @@ func walkObserverDirectoriesPolicy(ctx context.Context, root string, policy Syml
 				return ErrSymlink
 			}
 			if policy != FollowSymlinks {
-				return filepath.SkipDir
+				return nil
 			}
 		}
 		if path == root {

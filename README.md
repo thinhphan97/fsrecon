@@ -128,6 +128,12 @@ only needs bounded filesystem invalidation hints. Hints are not a complete or
 ordered operation log; startup, overflow, and backend loss produce broader
 subtree hints. Observer does not use snapshots, expected state, checksums, or
 ChangeSink generations.
+Normal changes prefer exact path hints. Directory removal emits a subtree hint
+even when a filter excludes the directory; uncertain rename topology escalates
+to a root subtree hint. `IgnoreSymlinks` and `ReportSymlinks` never follow
+targets, `RejectSymlinks` fails topology setup, and `FollowSymlinks` is
+currently unsupported for Observer. `ObserverRunning` means watch coverage is
+believed complete; recovery failures transition to `ObserverDegraded`.
 
 ## Run the demo
 
