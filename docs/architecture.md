@@ -47,3 +47,5 @@ Integrity scrub uses the same sink and session-local generation sequence, but
 does not mutate the metadata snapshot.
 Pending generations are retained for in-process retries after delivery or
 snapshot failures; they are discarded on process restart with the old session.
+Reconcile and Scrub share one coordinator and at most one pending authoritative
+generation; a new operation resumes it before allocating the next generation.

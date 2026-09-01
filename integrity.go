@@ -66,8 +66,14 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 	if closed {
 		return IntegrityReport{}, ErrClosed
 	}
-	if t.pendingIntegrity != nil {
-		return t.resumePendingIntegrity(ctx)
+	if t.pending != nil {
+		if t.pending.kind == pendingReconcile {
+			if _, err := t.resumePending(ctx); err != nil {
+				return IntegrityReport{}, err
+			}
+		} else {
+			return t.resumePendingIntegrity(ctx)
+		}
 	}
 
 	report := IntegrityReport{StartedAt: time.Now(), Generation: t.generation.Load() + 1}
@@ -165,7 +171,7 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 			}
 			if err := delivery.Add(eventFromStaged(staged)); err != nil {
 				_ = input.Close()
-				t.pendingIntegrity = &pendingIntegrityGeneration{sessionID: t.sessionID, generation: report.Generation, report: report, events: cloneEvents(allEvents)}
+				t.pending = &pendingGeneration{kind: pendingIntegrity, sessionID: t.sessionID, generation: report.Generation, integrity: &report, events: cloneEvents(allEvents)}
 				return report, err
 			}
 		}
@@ -173,7 +179,7 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 			return report, fmt.Errorf("fsrecon: close integrity change log: %w", err)
 		}
 		if err := delivery.Finish(); err != nil {
-			t.pendingIntegrity = &pendingIntegrityGeneration{sessionID: t.sessionID, generation: report.Generation, report: report, events: cloneEvents(allEvents)}
+			t.pending = &pendingGeneration{kind: pendingIntegrity, sessionID: t.sessionID, generation: report.Generation, integrity: &report, events: cloneEvents(allEvents)}
 			return report, err
 		}
 	}
@@ -188,19 +194,29 @@ func (t *Tracker) Scrub(ctx context.Context) (IntegrityReport, error) {
 }
 
 func (t *Tracker) resumePendingIntegrity(ctx context.Context) (IntegrityReport, error) {
-	p := t.pendingIntegrity
+	p := t.pending
+	if p == nil || p.integrity == nil {
+		return IntegrityReport{}, fmt.Errorf("fsrecon: no pending integrity generation")
+	}
 	delivery := newChangeBatcher(ctx, t.config.ChangeSink, p.sessionID, p.generation, t.config.ChangeBatchSize)
 	for _, event := range p.events {
 		if err := delivery.Add(event); err != nil {
-			return p.report, err
+			return *p.integrity, err
 		}
 	}
 	if err := delivery.Finish(); err != nil {
-		return p.report, err
+		return *p.integrity, err
 	}
-	t.pendingIntegrity = nil
+	report := *p.integrity
+	t.pending = nil
 	t.generation.Store(p.generation)
-	return p.report, nil
+	t.stats.integrityScanned.Add(report.Scanned)
+	t.stats.corruptDetected.Add(report.Corrupt)
+	t.stats.reportEventsTruncated.Add(report.EventsTruncated)
+	for _, event := range report.Events {
+		t.sendEvent(event)
+	}
+	return report, nil
 }
 
 var _ IntegrityChecker = SHA256Checker{}

@@ -411,6 +411,8 @@ retries the same semantic diff with the same batch identity. Delivery is
 at-least-once, so sinks must be idempotent. Once a batch is first attempted,
 its identity always refers to the same immutable payload; retries resend the
 staged generation rather than recomputing it from a changed filesystem.
+Reconcile and Scrub share one authoritative coordinator, so only one pending
+generation can exist and a new operation resumes it before allocating another.
 
 ```go
 stats := tracker.Stats()

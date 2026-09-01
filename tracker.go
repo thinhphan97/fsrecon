@@ -71,20 +71,19 @@ type Tracker struct {
 	sessionID      string
 	cancel         context.CancelFunc
 
-	reconcileMu      sync.Mutex
-	integrityMu      sync.Mutex
-	backend          internalbackend.Backend
-	watchTree        *watchtree.Tree
-	newBackend       func(uint) internalbackend.Backend
-	events           chan Event
-	errors           chan error
-	closeOnce        sync.Once
-	wg               sync.WaitGroup
-	stats            trackerStats
-	generation       atomic.Uint64
-	pending          *pendingGeneration
-	pendingIntegrity *pendingIntegrityGeneration
-	dirtyPending     atomic.Bool
+	reconcileMu  sync.Mutex
+	integrityMu  sync.Mutex
+	backend      internalbackend.Backend
+	watchTree    *watchtree.Tree
+	newBackend   func(uint) internalbackend.Backend
+	events       chan Event
+	errors       chan error
+	closeOnce    sync.Once
+	wg           sync.WaitGroup
+	stats        trackerStats
+	generation   atomic.Uint64
+	pending      *pendingGeneration
+	dirtyPending atomic.Bool
 }
 
 type trackerStats struct {

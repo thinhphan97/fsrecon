@@ -33,7 +33,13 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 		return ReconcileReport{}, ErrClosed
 	}
 	if t.pending != nil {
-		return t.resumePending(ctx)
+		if t.pending.kind == pendingIntegrity {
+			if _, err := t.resumePendingIntegrity(ctx); err != nil {
+				return ReconcileReport{}, err
+			}
+		} else {
+			return t.resumePending(ctx)
+		}
 	}
 	t.setState(StateReconciling)
 	report := ReconcileReport{StartedAt: time.Now()}
@@ -177,7 +183,7 @@ func (t *Tracker) reconcileScopes(ctx context.Context, requested []string) (Reco
 		puts = append(puts, state)
 	}
 	if t.config.ChangeSink != nil {
-		t.pending = &pendingGeneration{sessionID: t.sessionID, generation: report.Generation, report: report,
+		t.pending = &pendingGeneration{kind: pendingReconcile, sessionID: t.sessionID, generation: report.Generation, report: report,
 			events: cloneEvents(allEvents), puts: append([]FileState(nil), puts...), deletes: append([]string(nil), deletes...)}
 		if err := t.deliverPending(ctx); err != nil {
 			return fail(err)
