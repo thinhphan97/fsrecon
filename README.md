@@ -21,7 +21,7 @@ Expected state (optional) ─────┘
 ```
 
 > [!IMPORTANT]
-> Version 1.0 implements the complete watcher-to-reconciliation path, recursive
+> Version 1.2 implements the complete watcher-to-reconciliation path, recursive
 > watch registration, dirty-subtree batching, overflow recovery, persistent
 > snapshots, explicit integrity scrubbing, and cross-platform quality gates.
 
